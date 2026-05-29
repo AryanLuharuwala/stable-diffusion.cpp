@@ -276,6 +276,44 @@ struct UNetModel : public DiffusionModel {
     }
 };
 
+// CF12-W7: a DiffusionModel whose per-step UNet eval is delegated to a remote
+// callback (the coordinator drives the N-way block chain across rigs). The
+// host runs sd.cpp's real sample() loop — denoiser scalings, sigmas, sampler
+// all local and unchanged — and only the diffusion_model->compute(x_in, t,
+// cond) call goes remote. Non-compute virtuals forward to `inner` (the real
+// model, used for config like adm_in_channels) so setup paths still work.
+using RemoteUNetFn = std::function<bool(const DiffusionParams& params,
+                                        sd::Tensor<float>& out_eps)>;
+
+struct RemoteUNetModel : public DiffusionModel {
+    std::shared_ptr<DiffusionModel> inner;
+    RemoteUNetFn fn;
+
+    RemoteUNetModel(std::shared_ptr<DiffusionModel> inner_, RemoteUNetFn fn_)
+        : inner(std::move(inner_)), fn(std::move(fn_)) {}
+
+    std::string get_desc() override { return "remote-unet"; }
+    void alloc_params_buffer() override {}
+    void free_params_buffer() override {}
+    void free_compute_buffer() override {}
+    void get_param_tensors(std::map<std::string, ggml_tensor*>&) override {}
+    size_t get_params_buffer_size() override { return 0; }
+    int64_t get_adm_in_channels() override { return inner ? inner->get_adm_in_channels() : 0; }
+    void set_flash_attention_enabled(bool) override {}
+    void set_max_graph_vram_bytes(size_t) override {}
+    void set_circular_axes(bool, bool) override {}
+
+    sd::Tensor<float> compute(int n_threads,
+                              const DiffusionParams& diffusion_params) override {
+        (void)n_threads;
+        sd::Tensor<float> out;
+        if (!fn || !fn(diffusion_params, out)) {
+            return {};
+        }
+        return out;
+    }
+};
+
 struct MMDiTModel : public DiffusionModel {
     MMDiTRunner mmdit;
 

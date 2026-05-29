@@ -138,6 +138,11 @@ public:
     std::shared_ptr<Conditioner> cond_stage_model;
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
     std::shared_ptr<DiffusionModel> diffusion_model;
+    // CF12-W7: when set, sample() delegates each per-step UNet eval to this
+    // callback (the coordinator drives the N-way block chain across rigs)
+    // instead of running diffusion_model->compute locally. Everything else
+    // (TE, denoiser scalings, sigmas, sampler, VAE) runs on this host.
+    RemoteUNetFn remote_unet_fn;
     std::shared_ptr<DiffusionModel> high_noise_diffusion_model;
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
@@ -1868,6 +1873,14 @@ public:
         float img_cfg_scale = guidance.img_cfg;
         float slg_scale     = guidance.slg.scale;
 
+        // CF12-W7: if a remote UNet callback is installed, run the per-step
+        // UNet eval remotely (distributed N-way block chain) — everything
+        // else in this sample() loop stays local and unchanged.
+        std::shared_ptr<DiffusionModel> eff_diffusion_model = work_diffusion_model;
+        if (remote_unet_fn) {
+            eff_diffusion_model = std::make_shared<RemoteUNetModel>(work_diffusion_model, remote_unet_fn);
+        }
+
         sd_sample::SampleCacheRuntime cache_runtime = sd_sample::init_sample_cache_runtime(version,
                                                                                            cache_params,
                                                                                            denoiser.get(),
@@ -2003,7 +2016,7 @@ public:
                     return std::move(cached_output);
                 }
 
-                auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                auto output_opt = eff_diffusion_model->compute(n_threads, diffusion_params);
                 if (output_opt.empty()) {
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
@@ -3231,6 +3244,48 @@ int sd_compute_unet_split_range(sd_ctx_t* sd_ctx,
         state->last_half = 0;
     }
     return SD_SPLIT_OK;
+}
+
+void sd_set_remote_unet_cb(sd_ctx_t* sd_ctx, sd_remote_unet_cb_t cb, void* user) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return;
+    }
+    if (cb == nullptr) {
+        sd_ctx->sd->remote_unet_fn = nullptr;
+        return;
+    }
+    sd_ctx->sd->remote_unet_fn = [cb, user](const DiffusionParams& p, sd::Tensor<float>& out) -> bool {
+        static const sd::Tensor<float> kEmpty;
+        const sd::Tensor<float>& x   = p.x ? *p.x : kEmpty;
+        const sd::Tensor<float>& ctx = p.context ? *p.context : kEmpty;
+        const sd::Tensor<float>& y   = p.y ? *p.y : kEmpty;
+        float ts = (p.timesteps && p.timesteps->numel() > 0) ? p.timesteps->data()[0] : 0.f;
+
+        float*  out_eps  = nullptr;
+        int64_t out_ne[8] = {0};
+        int     out_ndim = 0;
+        int rc = cb(user,
+                    x.data(), x.shape().data(), static_cast<int>(x.dim()),
+                    ts,
+                    ctx.empty() ? nullptr : ctx.data(),
+                    ctx.empty() ? nullptr : ctx.shape().data(),
+                    static_cast<int>(ctx.dim()),
+                    y.empty() ? nullptr : y.data(),
+                    y.empty() ? nullptr : y.shape().data(),
+                    static_cast<int>(y.dim()),
+                    &out_eps, out_ne, &out_ndim);
+        if (rc != 0 || out_eps == nullptr || out_ndim <= 0 || out_ndim > 8) {
+            if (out_eps) std::free(out_eps);
+            return false;
+        }
+        std::vector<int64_t> sh(out_ne, out_ne + out_ndim);
+        out = sd::Tensor<float>(sh);
+        if (out.numel() > 0) {
+            std::memcpy(out.data(), out_eps, static_cast<size_t>(out.numel()) * sizeof(float));
+        }
+        std::free(out_eps);
+        return true;
+    };
 }
 
 int sd_unet_block_count(const sd_ctx_t* sd_ctx) {

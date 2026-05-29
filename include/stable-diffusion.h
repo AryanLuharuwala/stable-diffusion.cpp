@@ -603,6 +603,26 @@ SD_API int sd_compute_unet_split_range(
 // role-chain path. The planner partitions [0, count) across N rigs (dynamic N).
 SD_API int sd_unet_block_count(const sd_ctx_t* sd_ctx);
 
+// CF12-W7: remote-denoise hook. When a callback is installed, the host runs
+// sd.cpp's full sample() loop (TE, denoiser scalings, sigmas, sampler, VAE all
+// local) but delegates each per-step UNet eval to `cb` — the coordinator drives
+// the N-way block chain across rigs and returns the eps. Pass cb=NULL to clear.
+//
+// cb is invoked once per conditioning eval (cond and uncond separately under
+// CFG). x is the scaled UNet input (WHCN), timestep the UNet t, ctx the
+// c_crossattn (prompt embeds), y the c_vector (SDXL pooled; ndim 0 if absent).
+// The callee mallocs *out_eps (host frees) and fills out_ne[0..*out_ndim)
+// (out_ne points at a caller buffer of >= 8 slots). Return 0 on success.
+typedef int (*sd_remote_unet_cb_t)(
+    void*          user,
+    const float*   x,   const int64_t* x_ne,   int x_ndim,
+    float          timestep,
+    const float*   ctx, const int64_t* ctx_ne, int ctx_ndim,
+    const float*   y,   const int64_t* y_ne,   int y_ndim,
+    float**        out_eps, int64_t* out_ne,   int* out_ndim);
+
+SD_API void sd_set_remote_unet_cb(sd_ctx_t* sd_ctx, sd_remote_unet_cb_t cb, void* user);
+
 // Backbone tag derived from the loaded model — "sd1" | "sd2" | "sdxl" |
 // "sd3" | "flux" | "pixart" | "unknown".  Used by the role bridge's
 // cap-advert so the planner sees the real backbone, not a filename guess.
