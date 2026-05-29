@@ -185,6 +185,122 @@ public:
     int model_channels  = 320;
     int adm_in_channels = 2816;  // only for VERSION_SDXL/SVD
 
+    // CF12-W6a: ds factor at the middle-block boundary, derived from the
+    // channel-mult ladder (each non-final level doubles ds). Used by the
+    // split-runner's half1 graph to reconstruct the carry-state.
+    int boundary_ds() const {
+        int ds = 1;
+        for (size_t i = 0; i + 1 < channel_mult.size(); ++i) {
+            ds *= 2;
+        }
+        return ds;
+    }
+
+    // ─── CF12-W7: N-way UNet block-split schedule ────────────────────────
+    //
+    // The monolithic forward() is a linear sequence of blocks:
+    //   [0]                       conv_in            (pushes hs[0])
+    //   [1 .. n_in-1]             input res/down     (each pushes hs)
+    //   [n_in]                    middle             (non-tiny only)
+    //   [n_in+1 .. total-1]       output res/up      (each pops hs)
+    // with a final out-conv folded onto the last stage (hi == total).
+    //
+    // `ds`, layer names, attention placement, upsample sublayer indices and
+    // controlnet offsets are all pure functions of the block index, so any
+    // contiguous range [lo, hi) is reconstructible from the carry-state
+    // {h, hs, emb} alone — no extra wire fields. forward_range() walks this
+    // schedule; forward_half0/half1/forward delegate to it (so the existing
+    // 2-way path is byte-identical and acts as a regression guard).
+    struct BlockStep {
+        enum Kind { ConvIn, InputRes, InputDown, Middle, OutputRes } kind = ConvIn;
+        int  idx           = 0;      // input_block_idx / output_block_idx for layer names
+        int  ds            = 1;      // downsample factor during this block (attention test)
+        bool has_attn      = false;  // attention sublayer present
+        bool upsample      = false;  // OutputRes: an upsample follows
+        int  up_sample_idx = 1;      // OutputRes: upsample sublayer name index
+    };
+
+    // Pure simulation of the input/middle/output loops — records per-block
+    // metadata without building any graph ops. Mirrors forward_half0/half1.
+    std::vector<BlockStep> build_split_schedule() const {
+        std::vector<BlockStep> sch;
+        const size_t len_mults = channel_mult.size();
+        auto attn_at = [&](int d) {
+            return std::find(attention_resolutions.begin(), attention_resolutions.end(), d) != attention_resolutions.end();
+        };
+        { BlockStep s; s.kind = BlockStep::ConvIn; s.idx = 0; s.ds = 1; sch.push_back(s); }
+        int input_block_idx = 0;
+        int ds              = 1;
+        for (int i = 0; i < (int)len_mults; i++) {
+            for (int j = 0; j < num_res_blocks; j++) {
+                input_block_idx += 1;
+                BlockStep s; s.kind = BlockStep::InputRes; s.idx = input_block_idx; s.ds = ds;
+                s.has_attn = attn_at(ds);
+                sch.push_back(s);
+            }
+            if (i != (int)len_mults - 1) {
+                ds *= 2;
+                input_block_idx += 1;
+                BlockStep s; s.kind = BlockStep::InputDown; s.idx = input_block_idx; s.ds = ds;
+                sch.push_back(s);
+            }
+        }
+        { BlockStep s; s.kind = BlockStep::Middle; s.ds = ds;
+          s.has_attn = (version != VERSION_SDXL_SSD1B && version != VERSION_SDXL_VEGA);
+          sch.push_back(s); }
+        int output_block_idx = 0;
+        for (int i = (int)len_mults - 1; i >= 0; i--) {
+            for (int j = 0; j < num_res_blocks + 1; j++) {
+                BlockStep s; s.kind = BlockStep::OutputRes; s.idx = output_block_idx; s.ds = ds;
+                s.has_attn      = attn_at(ds);
+                s.up_sample_idx = s.has_attn ? 2 : 1;
+                if (i > 0 && j == num_res_blocks) {
+                    s.upsample = true;
+                    ds /= 2;
+                }
+                sch.push_back(s);
+                output_block_idx += 1;
+            }
+        }
+        return sch;
+    }
+
+    // Total splittable blocks; 0 == not split-capable (tiny UNet variants use
+    // a different index dance that we don't slice — they fall back to the
+    // whole-UNet / role-chain path).
+    int num_split_blocks() const {
+        if (tiny_unet) return 0;
+        return (int)build_split_schedule().size();
+    }
+
+    // The legacy 2-way cut point: index immediately after the middle block.
+    int split_mid_cut() const {
+        const auto sch = build_split_schedule();
+        for (size_t i = 0; i < sch.size(); ++i) {
+            if (sch[i].kind == BlockStep::Middle) return (int)i + 1;
+        }
+        return (int)sch.size() / 2;
+    }
+
+    struct UnetHalfState;  // defined below (carry-state used by forward_range)
+
+    // Run linearized blocks [lo, hi). lo==0 computes the prelude (emb +
+    // conv_in) from x/timesteps/c_concat/y. hi==num_split_blocks() appends
+    // the final out-conv (io.h becomes the noise_pred). Otherwise io is the
+    // carry handed to the next stage.
+    void forward_range(GGMLRunnerContext* ctx,
+                       UnetHalfState& io,
+                       int lo,
+                       int hi,
+                       ggml_tensor* x,
+                       ggml_tensor* timesteps,
+                       ggml_tensor* context,
+                       ggml_tensor* c_concat              = nullptr,
+                       ggml_tensor* y                     = nullptr,
+                       int num_video_frames               = -1,
+                       std::vector<ggml_tensor*> controls = {},
+                       float control_strength             = 0.f);
+
     UnetModelBlock(SDVersion version = VERSION_SD1, const String2TensorStorage& tensor_storage_map = {})
         : version(version) {
         if (sd_version_is_sd2(version)) {
@@ -424,6 +540,42 @@ public:
         }
     }
 
+    // ─── CF12-W6a: UNet block-split carry-state ──────────────────────────
+    //
+    // forward_half0 runs prelude + input_blocks + middle_block.
+    // forward_half1 runs output_blocks + final out conv.
+    // When chained inline (same graph build), the result is byte-identical
+    // to the monolithic forward() that lived here before — see forward()
+    // below which simply wires the two halves back-to-back.
+    //
+    // The split exists so an external driver can build two graphs with
+    // independent compute-buffer footprints (one rig owns the input-side
+    // weights, another owns the output-side weights) and ferry the
+    // carry-state between them.
+    struct UnetHalfState {
+        ggml_tensor* h   = nullptr;            // hidden state after middle_block
+        std::vector<ggml_tensor*> hs;          // skip residual stack (LIFO)
+        ggml_tensor* emb = nullptr;            // time + label embedding
+        int ds           = 1;                  // downsample factor at boundary
+    };
+
+    UnetHalfState forward_half0(GGMLRunnerContext* ctx,
+                                ggml_tensor* x,
+                                ggml_tensor* timesteps,
+                                ggml_tensor* context,
+                                ggml_tensor* c_concat              = nullptr,
+                                ggml_tensor* y                     = nullptr,
+                                int num_video_frames               = -1,
+                                std::vector<ggml_tensor*> controls = {},
+                                float control_strength             = 0.f);
+
+    ggml_tensor* forward_half1(GGMLRunnerContext* ctx,
+                               const UnetHalfState& st,
+                               ggml_tensor* context,
+                               int num_video_frames               = -1,
+                               std::vector<ggml_tensor*> controls = {},
+                               float control_strength             = 0.f);
+
     ggml_tensor* forward(GGMLRunnerContext* ctx,
                          ggml_tensor* x,
                          ggml_tensor* timesteps,
@@ -439,31 +591,48 @@ public:
         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
         // y: [N, adm_in_channels] or [1, adm_in_channels]
         // return: [N, out_channels, h, w]
-        if (context != nullptr) {
-            if (context->ne[2] != x->ne[3]) {
-                context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, context->ne[0], context->ne[1], x->ne[3]));
-            }
+        UnetHalfState st = forward_half0(ctx, x, timesteps, context, c_concat, y,
+                                         num_video_frames, controls, control_strength);
+        return forward_half1(ctx, st, context, num_video_frames, controls, control_strength);
+    }
+};
+
+// ─── CF12-W6a: out-of-class definitions of forward_half0 / forward_half1 ──
+// Defined here (still in the header, since UNetModelRunner is header-only)
+// so the file stays a single translation-unit drop-in.
+
+inline UnetModelBlock::UnetHalfState UnetModelBlock::forward_half0(
+    GGMLRunnerContext* ctx,
+    ggml_tensor* x,
+    ggml_tensor* timesteps,
+    ggml_tensor* context,
+    ggml_tensor* c_concat,
+    ggml_tensor* y,
+    int num_video_frames,
+    std::vector<ggml_tensor*> controls,
+    float control_strength) {
+    if (context != nullptr) {
+        if (context->ne[2] != x->ne[3]) {
+            context = ggml_repeat(ctx->ggml_ctx, context, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, context->ne[0], context->ne[1], x->ne[3]));
         }
+    }
 
-        if (c_concat != nullptr) {
-            if (c_concat->ne[3] != x->ne[3]) {
-                c_concat = ggml_repeat(ctx->ggml_ctx, c_concat, x);
-            }
-            x = ggml_concat(ctx->ggml_ctx, x, c_concat, 2);
+    if (c_concat != nullptr) {
+        if (c_concat->ne[3] != x->ne[3]) {
+            c_concat = ggml_repeat(ctx->ggml_ctx, c_concat, x);
         }
+        x = ggml_concat(ctx->ggml_ctx, x, c_concat, 2);
+    }
 
-        if (y != nullptr) {
-            if (y->ne[1] != x->ne[3]) {
-                y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, y->ne[0], x->ne[3]));
-            }
+    if (y != nullptr) {
+        if (y->ne[1] != x->ne[3]) {
+            y = ggml_repeat(ctx->ggml_ctx, y, ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, y->ne[0], x->ne[3]));
         }
+    }
 
-        auto time_embed_0     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.0"]);
-        auto time_embed_2     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.2"]);
-        auto input_blocks_0_0 = std::dynamic_pointer_cast<Conv2d>(blocks["input_blocks.0.0"]);
-
-        auto out_0 = std::dynamic_pointer_cast<GroupNorm32>(blocks["out.0"]);
-        auto out_2 = std::dynamic_pointer_cast<Conv2d>(blocks["out.2"]);
+    auto time_embed_0     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.0"]);
+    auto time_embed_2     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.2"]);
+    auto input_blocks_0_0 = std::dynamic_pointer_cast<Conv2d>(blocks["input_blocks.0.0"]);
 
         auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, model_channels);  // [N, model_channels]
 
@@ -540,7 +709,26 @@ public:
             auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[controls.size() - 1], control_strength, true);
             h       = ggml_add(ctx->ggml_ctx, h, cs);  // middle control
         }
-        int control_offset = static_cast<int>(controls.size() - 2);
+    return UnetHalfState{h, hs, emb, ds};
+}
+
+inline ggml_tensor* UnetModelBlock::forward_half1(
+    GGMLRunnerContext* ctx,
+    const UnetHalfState& st,
+    ggml_tensor* context,
+    int num_video_frames,
+    std::vector<ggml_tensor*> controls,
+    float control_strength) {
+    auto out_0 = std::dynamic_pointer_cast<GroupNorm32>(blocks["out.0"]);
+    auto out_2 = std::dynamic_pointer_cast<Conv2d>(blocks["out.2"]);
+
+    ggml_tensor* h               = st.h;
+    std::vector<ggml_tensor*> hs = st.hs;
+    ggml_tensor* emb             = st.emb;
+    int ds                       = st.ds;
+    size_t len_mults             = channel_mult.size();
+
+    int control_offset = static_cast<int>(controls.size() - 2);
 
         // output_blocks
         int output_block_idx = 0;
@@ -596,8 +784,165 @@ public:
         h = out_2->forward(ctx, h);
         ggml_set_name(h, "bench-end");
         return h;  // [N, out_channels, h, w]
+}
+
+// ─── CF12-W7: N-way block-split forward over the linearized schedule ─────
+//
+// Purely additive: forward()/forward_half0/forward_half1 above are left
+// byte-identical (they remain the proven monolithic + 2-way path, and the
+// only path used by tiny-UNet variants). forward_range reproduces the same
+// op sequence for an arbitrary contiguous block range [lo, hi); the CPU
+// equivalence test (UNetModelRunner::test_split) checks that chaining
+// forward_range segments reproduces forward() bit-for-bit before any GPU
+// run. Callers must gate on num_split_blocks() > 0 (i.e. non-tiny).
+inline void UnetModelBlock::forward_range(
+    GGMLRunnerContext* ctx,
+    UnetHalfState& io,
+    int lo,
+    int hi,
+    ggml_tensor* x,
+    ggml_tensor* timesteps,
+    ggml_tensor* context,
+    ggml_tensor* c_concat,
+    ggml_tensor* y,
+    int num_video_frames,
+    std::vector<ggml_tensor*> controls,
+    float control_strength) {
+    const std::vector<BlockStep> sch = build_split_schedule();
+    const int total = (int)sch.size();
+    if (lo < 0)     lo = 0;
+    if (hi > total) hi = total;
+
+    ggml_tensor* h               = io.h;
+    std::vector<ggml_tensor*> hs = io.hs;
+    ggml_tensor* emb             = io.emb;
+
+    int b = lo;
+    if (lo == 0) {
+        // ── prelude (mirrors forward_half0 head) ──────────────────────
+        if (context != nullptr && context->ne[2] != x->ne[3]) {
+            context = ggml_repeat(ctx->ggml_ctx, context,
+                                  ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32,
+                                                     context->ne[0], context->ne[1], x->ne[3]));
+        }
+        if (c_concat != nullptr) {
+            if (c_concat->ne[3] != x->ne[3]) {
+                c_concat = ggml_repeat(ctx->ggml_ctx, c_concat, x);
+            }
+            x = ggml_concat(ctx->ggml_ctx, x, c_concat, 2);
+        }
+        if (y != nullptr && y->ne[1] != x->ne[3]) {
+            y = ggml_repeat(ctx->ggml_ctx, y,
+                            ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, y->ne[0], x->ne[3]));
+        }
+
+        auto time_embed_0     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.0"]);
+        auto time_embed_2     = std::dynamic_pointer_cast<Linear>(blocks["time_embed.2"]);
+        auto input_blocks_0_0 = std::dynamic_pointer_cast<Conv2d>(blocks["input_blocks.0.0"]);
+
+        auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, model_channels);
+        emb        = time_embed_0->forward(ctx, t_emb);
+        emb        = ggml_silu_inplace(ctx->ggml_ctx, emb);
+        emb        = time_embed_2->forward(ctx, emb);
+        if (y != nullptr) {
+            auto label_embed_0 = std::dynamic_pointer_cast<Linear>(blocks["label_emb.0.0"]);
+            auto label_embed_2 = std::dynamic_pointer_cast<Linear>(blocks["label_emb.0.2"]);
+            auto label_emb     = label_embed_0->forward(ctx, y);
+            label_emb          = ggml_silu_inplace(ctx->ggml_ctx, label_emb);
+            label_emb          = label_embed_2->forward(ctx, label_emb);
+            emb                = ggml_add(ctx->ggml_ctx, emb, label_emb);
+        }
+
+        h = input_blocks_0_0->forward(ctx, x);
+        sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks.0", "h");
+        ggml_set_name(h, "bench-start");
+        hs.clear();
+        hs.push_back(h);
+        b = 1;
     }
-};
+
+    for (; b < hi; ++b) {
+        const BlockStep& s = sch[b];
+        switch (s.kind) {
+            case BlockStep::ConvIn:
+                // only valid at b==0, handled by the prelude above.
+                break;
+            case BlockStep::InputRes: {
+                std::string n0 = "input_blocks." + std::to_string(s.idx) + ".0";
+                h              = resblock_forward(n0, ctx, h, emb, num_video_frames);
+                if (s.has_attn) {
+                    std::string n1 = "input_blocks." + std::to_string(s.idx) + ".1";
+                    h              = attention_layer_forward(n1, ctx, h, context, num_video_frames);
+                }
+                sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks." + std::to_string(s.idx), "h");
+                hs.push_back(h);
+                break;
+            }
+            case BlockStep::InputDown: {
+                std::string n0 = "input_blocks." + std::to_string(s.idx) + ".0";
+                auto block     = std::dynamic_pointer_cast<DownSampleBlock>(blocks[n0]);
+                h              = block->forward(ctx, h);
+                hs.push_back(h);
+                break;
+            }
+            case BlockStep::Middle: {
+                h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);
+                if (s.has_attn) {
+                    h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);
+                    h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);
+                }
+                sd::ggml_graph_cut::mark_graph_cut(h, "unet.middle_block", "h");
+                if (!controls.empty()) {
+                    auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[controls.size() - 1], control_strength, true);
+                    h       = ggml_add(ctx->ggml_ctx, h, cs);  // middle control
+                }
+                break;
+            }
+            case BlockStep::OutputRes: {
+                auto h_skip = hs.back();
+                hs.pop_back();
+                if (!controls.empty()) {
+                    // control_offset in forward_half1 starts at size-2 and
+                    // decrements per output block → size-2-idx for block idx.
+                    int control_offset = (int)controls.size() - 2 - s.idx;
+                    if (control_offset >= 0 && control_offset < (int)controls.size()) {
+                        auto cs = ggml_ext_scale(ctx->ggml_ctx, controls[control_offset], control_strength, true);
+                        h_skip  = ggml_add(ctx->ggml_ctx, h_skip, cs);  // control net condition
+                    }
+                }
+                h = ggml_concat(ctx->ggml_ctx, h, h_skip, 2);
+
+                std::string n0 = "output_blocks." + std::to_string(s.idx) + ".0";
+                h              = resblock_forward(n0, ctx, h, emb, num_video_frames);
+                if (s.has_attn) {
+                    std::string n1 = "output_blocks." + std::to_string(s.idx) + ".1";
+                    h              = attention_layer_forward(n1, ctx, h, context, num_video_frames);
+                }
+                if (s.upsample) {
+                    std::string nu = "output_blocks." + std::to_string(s.idx) + "." + std::to_string(s.up_sample_idx);
+                    auto block     = std::dynamic_pointer_cast<UpSampleBlock>(blocks[nu]);
+                    h              = block->forward(ctx, h);
+                }
+                sd::ggml_graph_cut::mark_graph_cut(h, "unet.output_blocks." + std::to_string(s.idx), "h");
+                break;
+            }
+        }
+    }
+
+    if (hi == total) {
+        auto out_0 = std::dynamic_pointer_cast<GroupNorm32>(blocks["out.0"]);
+        auto out_2 = std::dynamic_pointer_cast<Conv2d>(blocks["out.2"]);
+        h          = out_0->forward(ctx, h);
+        h          = ggml_silu_inplace(ctx->ggml_ctx, h);
+        h          = out_2->forward(ctx, h);
+        ggml_set_name(h, "bench-end");
+    }
+
+    io.h   = h;
+    io.hs  = std::move(hs);
+    io.emb = emb;
+    io.ds  = boundary_ds();  // informational; forward_range derives ds per block
+}
 
 struct UNetModelRunner : public GGMLRunner {
     UnetModelBlock unet;
@@ -680,6 +1025,290 @@ struct UNetModelRunner : public GGMLRunner {
         };
 
         return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+    }
+
+    // ─── CF12-W6a: cross-rig UNet split runner methods ──────────────────────
+    //
+    // Carry-state extracted at the middle-block boundary. Stored host-side
+    // (sd::Tensor<float>) so it can be serialized over the wire to a peer
+    // rig that owns the output_blocks weights. The `ds` (downsample factor)
+    // is reconstructible from `channel_mult.size()` and is not serialized.
+    struct SplitCarry {
+        sd::Tensor<float>              h;
+        std::vector<sd::Tensor<float>> hs;
+        sd::Tensor<float>              emb;
+    };
+
+    static constexpr const char* kSplitCacheH   = "unet.split.h";
+    static constexpr const char* kSplitCacheEmb = "unet.split.emb";
+
+    static std::string split_hs_key(size_t i) {
+        return std::string("unet.split.hs.") + std::to_string(i);
+    }
+
+    ggml_cgraph* build_graph_half0(const sd::Tensor<float>& x_tensor,
+                                   const sd::Tensor<float>& timesteps_tensor,
+                                   const sd::Tensor<float>& context_tensor               = {},
+                                   const sd::Tensor<float>& c_concat_tensor              = {},
+                                   const sd::Tensor<float>& y_tensor                     = {},
+                                   int num_video_frames                                  = -1,
+                                   const std::vector<sd::Tensor<float>>& controls_tensor = {},
+                                   float control_strength                                = 0.f) {
+        ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
+
+        ggml_tensor* x         = make_input(x_tensor);
+        ggml_tensor* timesteps = make_input(timesteps_tensor);
+        ggml_tensor* context   = make_optional_input(context_tensor);
+        ggml_tensor* c_concat  = make_optional_input(c_concat_tensor);
+        ggml_tensor* y         = make_optional_input(y_tensor);
+        std::vector<ggml_tensor*> controls;
+        controls.reserve(controls_tensor.size());
+        for (const auto& control_tensor : controls_tensor) {
+            controls.push_back(make_input(control_tensor));
+        }
+        if (num_video_frames == -1) {
+            num_video_frames = static_cast<int>(x->ne[3]);
+        }
+
+        auto runner_ctx = get_context();
+        auto st         = unet.forward_half0(&runner_ctx, x, timesteps, context, c_concat, y,
+                                             num_video_frames, controls, control_strength);
+
+        runner_ctx.persist_cache_tensor(kSplitCacheH, st.h);
+        runner_ctx.persist_cache_tensor(kSplitCacheEmb, st.emb);
+        for (size_t i = 0; i < st.hs.size(); ++i) {
+            runner_ctx.persist_cache_tensor(split_hs_key(i), st.hs[i]);
+        }
+
+        ggml_build_forward_expand(gf, st.h);
+        return gf;
+    }
+
+    ggml_cgraph* build_graph_half1(const SplitCarry& carry,
+                                   const sd::Tensor<float>& context_tensor               = {},
+                                   int num_video_frames                                  = -1,
+                                   const std::vector<sd::Tensor<float>>& controls_tensor = {},
+                                   float control_strength                                = 0.f) {
+        ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
+
+        ggml_tensor* h       = make_input(carry.h);
+        ggml_tensor* emb     = make_input(carry.emb);
+        ggml_tensor* context = make_optional_input(context_tensor);
+        std::vector<ggml_tensor*> hs;
+        hs.reserve(carry.hs.size());
+        for (const auto& hs_tensor : carry.hs) {
+            hs.push_back(make_input(hs_tensor));
+        }
+        std::vector<ggml_tensor*> controls;
+        controls.reserve(controls_tensor.size());
+        for (const auto& control_tensor : controls_tensor) {
+            controls.push_back(make_input(control_tensor));
+        }
+        if (num_video_frames == -1) {
+            num_video_frames = static_cast<int>(h->ne[3]);
+        }
+
+        UnetModelBlock::UnetHalfState st;
+        st.h   = h;
+        st.hs  = hs;
+        st.emb = emb;
+        st.ds  = unet.boundary_ds();
+
+        auto runner_ctx  = get_context();
+        ggml_tensor* out = unet.forward_half1(&runner_ctx, st, context,
+                                              num_video_frames, controls, control_strength);
+        ggml_build_forward_expand(gf, out);
+        return gf;
+    }
+
+    bool read_cache_sd_tensor(const std::string& name, sd::Tensor<float>& out) {
+        ggml_tensor* t = get_cache_tensor_by_name(name);
+        if (t == nullptr) {
+            return false;
+        }
+        out = sd::make_sd_tensor_from_ggml<float>(t);
+        return true;
+    }
+
+    bool compute_half0(int n_threads,
+                       const sd::Tensor<float>& x,
+                       const sd::Tensor<float>& timesteps,
+                       const sd::Tensor<float>& context,
+                       const sd::Tensor<float>& c_concat,
+                       const sd::Tensor<float>& y,
+                       int num_video_frames,
+                       const std::vector<sd::Tensor<float>>& controls,
+                       float control_strength,
+                       SplitCarry& carry_out) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            return build_graph_half0(x, timesteps, context, c_concat, y,
+                                     num_video_frames, controls, control_strength);
+        };
+        auto result = GGMLRunner::compute<float>(get_graph, n_threads, false);
+        if (!result.has_value()) {
+            return false;
+        }
+        // result already corresponds to st.h via final_result; but we want the
+        // host copy from cache_ctx for the explicit carry-state. Read all
+        // persisted tensors back from cache.
+        sd::Tensor<float> h_host;
+        if (!read_cache_sd_tensor(kSplitCacheH, h_host)) {
+            return false;
+        }
+        sd::Tensor<float> emb_host;
+        if (!read_cache_sd_tensor(kSplitCacheEmb, emb_host)) {
+            return false;
+        }
+        std::vector<sd::Tensor<float>> hs_host;
+        for (size_t i = 0;; ++i) {
+            sd::Tensor<float> hs_i;
+            if (!read_cache_sd_tensor(split_hs_key(i), hs_i)) {
+                break;
+            }
+            hs_host.push_back(std::move(hs_i));
+        }
+        carry_out.h   = std::move(h_host);
+        carry_out.emb = std::move(emb_host);
+        carry_out.hs  = std::move(hs_host);
+        return true;
+    }
+
+    sd::Tensor<float> compute_half1(int n_threads,
+                                    const SplitCarry& carry,
+                                    const sd::Tensor<float>& context,
+                                    int num_video_frames,
+                                    const std::vector<sd::Tensor<float>>& controls,
+                                    float control_strength,
+                                    size_t output_dim_hint) {
+        auto get_graph = [&]() -> ggml_cgraph* {
+            return build_graph_half1(carry, context, num_video_frames, controls, control_strength);
+        };
+        return restore_trailing_singleton_dims(
+            GGMLRunner::compute<float>(get_graph, n_threads, false),
+            output_dim_hint);
+    }
+
+    // ─── CF12-W7: N-way range runner ─────────────────────────────────────
+    //
+    // Build the graph for blocks [lo, hi). lo==0 takes x/timesteps/c_concat/y
+    // as inputs (carry_in ignored); lo>0 takes the carry tensors as inputs.
+    // For the final stage (hi>=total) the graph expands on the noise_pred so
+    // GGMLRunner::compute returns it directly. For intermediate stages we
+    // persist h/emb/hs[] to the cache and expand on *every* carried tensor —
+    // pass-through residuals from carry_in are graph leaves and would not be
+    // reachable from h alone, so each must be an explicit graph root.
+    ggml_cgraph* build_graph_range(const SplitCarry& carry_in,
+                                   int lo,
+                                   int hi,
+                                   const sd::Tensor<float>& x_tensor,
+                                   const sd::Tensor<float>& timesteps_tensor,
+                                   const sd::Tensor<float>& context_tensor,
+                                   const sd::Tensor<float>& c_concat_tensor,
+                                   const sd::Tensor<float>& y_tensor,
+                                   int num_video_frames,
+                                   const std::vector<sd::Tensor<float>>& controls_tensor,
+                                   float control_strength) {
+        ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
+        const int total = unet.num_split_blocks();
+
+        UnetModelBlock::UnetHalfState io;
+        ggml_tensor* x         = nullptr;
+        ggml_tensor* timesteps = nullptr;
+        ggml_tensor* context   = make_optional_input(context_tensor);
+        ggml_tensor* c_concat  = nullptr;
+        ggml_tensor* y         = nullptr;
+
+        if (lo == 0) {
+            x         = make_input(x_tensor);
+            timesteps = make_input(timesteps_tensor);
+            c_concat  = make_optional_input(c_concat_tensor);
+            y         = make_optional_input(y_tensor);
+        } else {
+            io.h   = make_input(carry_in.h);
+            io.emb = make_input(carry_in.emb);
+            io.hs.reserve(carry_in.hs.size());
+            for (const auto& hs_tensor : carry_in.hs) {
+                io.hs.push_back(make_input(hs_tensor));
+            }
+        }
+
+        std::vector<ggml_tensor*> controls;
+        controls.reserve(controls_tensor.size());
+        for (const auto& control_tensor : controls_tensor) {
+            controls.push_back(make_input(control_tensor));
+        }
+
+        if (num_video_frames == -1) {
+            num_video_frames = (lo == 0) ? static_cast<int>(x->ne[3])
+                                         : static_cast<int>(io.h->ne[3]);
+        }
+
+        auto runner_ctx = get_context();
+        unet.forward_range(&runner_ctx, io, lo, hi, x, timesteps, context, c_concat, y,
+                           num_video_frames, controls, control_strength);
+
+        if (hi >= total) {
+            ggml_build_forward_expand(gf, io.h);  // final: io.h == noise_pred
+        } else {
+            runner_ctx.persist_cache_tensor(kSplitCacheH, io.h);
+            runner_ctx.persist_cache_tensor(kSplitCacheEmb, io.emb);
+            for (size_t i = 0; i < io.hs.size(); ++i) {
+                runner_ctx.persist_cache_tensor(split_hs_key(i), io.hs[i]);
+            }
+            ggml_build_forward_expand(gf, io.h);
+            ggml_build_forward_expand(gf, io.emb);
+            for (size_t i = 0; i < io.hs.size(); ++i) {
+                ggml_build_forward_expand(gf, io.hs[i]);
+            }
+        }
+        return gf;
+    }
+
+    // Run blocks [lo, hi). Final stage fills out_noise; intermediate stages
+    // fill carry_out. Returns false on compute / cache-readback failure.
+    bool compute_range(int n_threads,
+                       int lo,
+                       int hi,
+                       const SplitCarry& carry_in,
+                       const sd::Tensor<float>& x,
+                       const sd::Tensor<float>& timesteps,
+                       const sd::Tensor<float>& context,
+                       const sd::Tensor<float>& c_concat,
+                       const sd::Tensor<float>& y,
+                       int num_video_frames,
+                       const std::vector<sd::Tensor<float>>& controls,
+                       float control_strength,
+                       size_t output_dim_hint,
+                       SplitCarry& carry_out,
+                       sd::Tensor<float>& out_noise) {
+        const int total = unet.num_split_blocks();
+        auto get_graph  = [&]() -> ggml_cgraph* {
+            return build_graph_range(carry_in, lo, hi, x, timesteps, context,
+                                     c_concat, y, num_video_frames, controls, control_strength);
+        };
+        auto result = GGMLRunner::compute<float>(get_graph, n_threads, false);
+        if (!result.has_value()) {
+            return false;
+        }
+        if (hi >= total) {
+            out_noise = restore_trailing_singleton_dims(std::move(result), output_dim_hint);
+            return true;
+        }
+        if (!read_cache_sd_tensor(kSplitCacheH, carry_out.h)) {
+            return false;
+        }
+        if (!read_cache_sd_tensor(kSplitCacheEmb, carry_out.emb)) {
+            return false;
+        }
+        carry_out.hs.clear();
+        for (size_t i = 0;; ++i) {
+            sd::Tensor<float> hs_i;
+            if (!read_cache_sd_tensor(split_hs_key(i), hs_i)) {
+                break;
+            }
+            carry_out.hs.push_back(std::move(hs_i));
+        }
+        return true;
     }
 
     void test() {

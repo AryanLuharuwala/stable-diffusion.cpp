@@ -2857,6 +2857,414 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
     free(sd_ctx);
 }
 
+// ─── CF12-W6a: UNet block-split surface (llama-distributed extension) ──────
+//
+// Phase-2 — real cross-rig split.  The split-state holds host-side copies
+// of (x, timesteps, context, c_concat, y) staged before half=0, the carry
+// tuple (h, hs[], emb) produced by half=0, and the noise-pred produced by
+// half=1.  Bridge dispatches to diffusion_model->compute_half0/half1,
+// which currently exist on the UNet path only — other backbones return
+// SD_SPLIT_ENOTSUP via DiffusionModel's default implementation.
+
+struct sd_split_state_t {
+    sd::Tensor<float>              x;
+    sd::Tensor<float>              timesteps;
+    sd::Tensor<float>              context;
+    sd::Tensor<float>              c_concat;
+    sd::Tensor<float>              y;
+    sd::Tensor<float>              h;
+    std::vector<sd::Tensor<float>> hs;
+    sd::Tensor<float>              emb;
+    sd::Tensor<float>              noise_pred;
+    int                            step_idx     = 0;
+    int                            total_steps  = 0;
+    int                            last_half    = -1;  // -1 = uninitialised, 0 = h ready, 1 = noise_pred ready
+};
+
+sd_split_state_t* sd_split_state_new(void) {
+    return new sd_split_state_t();
+}
+
+void sd_split_state_free(sd_split_state_t* state) {
+    delete state;
+}
+
+static std::vector<int64_t> shape_from_c(const int64_t* shape, int ndims) {
+    std::vector<int64_t> out;
+    if (shape == nullptr || ndims <= 0) return out;
+    out.assign(shape, shape + ndims);
+    return out;
+}
+
+static int copy_into_tensor(sd::Tensor<float>& dst,
+                            const float* data,
+                            const int64_t* shape,
+                            int ndims) {
+    if (data == nullptr || shape == nullptr || ndims <= 0) {
+        dst = sd::Tensor<float>();
+        return SD_SPLIT_OK;
+    }
+    auto shape_v = shape_from_c(shape, ndims);
+    sd::Tensor<float> t(shape_v);
+    if (t.numel() > 0) {
+        std::memcpy(t.data(), data, static_cast<size_t>(t.numel()) * sizeof(float));
+    }
+    dst = std::move(t);
+    return SD_SPLIT_OK;
+}
+
+int sd_split_state_set_input(sd_split_state_t* state,
+                             const char* name,
+                             const float* data,
+                             const int64_t* shape,
+                             int ndims) {
+    if (state == nullptr || name == nullptr) return SD_SPLIT_EINVAL;
+    std::string n = name;
+    if (n == "x")         return copy_into_tensor(state->x,         data, shape, ndims);
+    if (n == "timesteps") return copy_into_tensor(state->timesteps, data, shape, ndims);
+    if (n == "context")   return copy_into_tensor(state->context,   data, shape, ndims);
+    if (n == "c_concat")  return copy_into_tensor(state->c_concat,  data, shape, ndims);
+    if (n == "y")         return copy_into_tensor(state->y,         data, shape, ndims);
+    return SD_SPLIT_EINVAL;
+}
+
+int sd_split_state_get_output(const sd_split_state_t* state,
+                              const float** data,
+                              const int64_t** shape,
+                              int* ndims) {
+    if (state == nullptr || data == nullptr || shape == nullptr || ndims == nullptr) {
+        return SD_SPLIT_EINVAL;
+    }
+    if (state->noise_pred.empty()) {
+        return SD_SPLIT_ESTATE;
+    }
+    *data  = state->noise_pred.data();
+    *shape = state->noise_pred.shape().data();
+    *ndims = static_cast<int>(state->noise_pred.shape().size());
+    return SD_SPLIT_OK;
+}
+
+int sd_split_state_get_carry_count(const sd_split_state_t* state, int* hs_count) {
+    if (state == nullptr || hs_count == nullptr) return SD_SPLIT_EINVAL;
+    *hs_count = static_cast<int>(state->hs.size());
+    return SD_SPLIT_OK;
+}
+
+int sd_split_state_get_carry_tensor(const sd_split_state_t* state,
+                                    const char* name,
+                                    const float** data,
+                                    const int64_t** shape,
+                                    int* ndims) {
+    if (state == nullptr || name == nullptr || data == nullptr ||
+        shape == nullptr || ndims == nullptr) {
+        return SD_SPLIT_EINVAL;
+    }
+    const sd::Tensor<float>* src = nullptr;
+    std::string n = name;
+    if      (n == "h")   src = &state->h;
+    else if (n == "emb") src = &state->emb;
+    else if (n.rfind("hs.", 0) == 0) {
+        int idx = std::atoi(n.c_str() + 3);
+        if (idx < 0 || static_cast<size_t>(idx) >= state->hs.size()) {
+            return SD_SPLIT_EINVAL;
+        }
+        src = &state->hs[static_cast<size_t>(idx)];
+    } else {
+        return SD_SPLIT_EINVAL;
+    }
+    if (src->empty()) return SD_SPLIT_ESTATE;
+    *data  = src->data();
+    *shape = src->shape().data();
+    *ndims = static_cast<int>(src->shape().size());
+    return SD_SPLIT_OK;
+}
+
+int sd_split_state_set_hs_count(sd_split_state_t* state, int hs_count) {
+    if (state == nullptr || hs_count < 0) return SD_SPLIT_EINVAL;
+    state->hs.clear();
+    state->hs.resize(static_cast<size_t>(hs_count));
+    return SD_SPLIT_OK;
+}
+
+int sd_split_state_set_carry_tensor(sd_split_state_t* state,
+                                    const char* name,
+                                    const float* data,
+                                    const int64_t* shape,
+                                    int ndims) {
+    if (state == nullptr || name == nullptr) return SD_SPLIT_EINVAL;
+    std::string n = name;
+    if (n == "h")   return copy_into_tensor(state->h,   data, shape, ndims);
+    if (n == "emb") return copy_into_tensor(state->emb, data, shape, ndims);
+    if (n.rfind("hs.", 0) == 0) {
+        int idx = std::atoi(n.c_str() + 3);
+        if (idx < 0 || static_cast<size_t>(idx) >= state->hs.size()) {
+            return SD_SPLIT_EINVAL;
+        }
+        return copy_into_tensor(state->hs[static_cast<size_t>(idx)], data, shape, ndims);
+    }
+    return SD_SPLIT_EINVAL;
+}
+
+namespace {
+constexpr uint32_t kSplitMagic   = 0x50534453u; // 'SDSP' little-endian
+constexpr uint16_t kSplitVersion = 1;
+
+void buf_push_bytes(std::vector<uint8_t>& buf, const void* p, size_t n) {
+    auto* b = static_cast<const uint8_t*>(p);
+    buf.insert(buf.end(), b, b + n);
+}
+
+template <typename T>
+void buf_push(std::vector<uint8_t>& buf, T v) {
+    buf_push_bytes(buf, &v, sizeof(T));
+}
+
+void buf_push_tensor(std::vector<uint8_t>& buf, const sd::Tensor<float>& t) {
+    uint32_t nd = static_cast<uint32_t>(t.shape().size());
+    buf_push<uint32_t>(buf, nd);
+    for (int64_t d : t.shape()) buf_push<int64_t>(buf, d);
+    buf_push_bytes(buf, t.data(), static_cast<size_t>(t.numel()) * sizeof(float));
+}
+
+bool buf_read_bytes(const uint8_t*& p, const uint8_t* end, void* out, size_t n) {
+    if (p + n > end) return false;
+    std::memcpy(out, p, n);
+    p += n;
+    return true;
+}
+
+template <typename T>
+bool buf_read(const uint8_t*& p, const uint8_t* end, T& v) {
+    return buf_read_bytes(p, end, &v, sizeof(T));
+}
+
+bool buf_read_tensor(const uint8_t*& p, const uint8_t* end, sd::Tensor<float>& out) {
+    uint32_t nd = 0;
+    if (!buf_read<uint32_t>(p, end, nd)) return false;
+    std::vector<int64_t> shape(nd);
+    for (uint32_t i = 0; i < nd; ++i) {
+        if (!buf_read<int64_t>(p, end, shape[i])) return false;
+    }
+    sd::Tensor<float> t(shape);
+    if (t.numel() > 0) {
+        if (!buf_read_bytes(p, end, t.data(),
+                            static_cast<size_t>(t.numel()) * sizeof(float))) {
+            return false;
+        }
+    }
+    out = std::move(t);
+    return true;
+}
+} // namespace
+
+int sd_split_state_serialize(const sd_split_state_t* state, uint8_t** out, size_t* nbytes) {
+    if (state == nullptr || out == nullptr || nbytes == nullptr) return SD_SPLIT_EINVAL;
+    *out = nullptr;
+    *nbytes = 0;
+    std::vector<uint8_t> buf;
+    buf.reserve(state->h.numel() * sizeof(float) + 256);
+    buf_push<uint32_t>(buf, kSplitMagic);
+    buf_push<uint16_t>(buf, kSplitVersion);
+    buf_push<uint32_t>(buf, static_cast<uint32_t>(state->step_idx));
+    buf_push<uint32_t>(buf, static_cast<uint32_t>(state->total_steps));
+    buf_push<uint32_t>(buf, static_cast<uint32_t>(state->hs.size()));
+    buf_push_tensor(buf, state->h);
+    buf_push_tensor(buf, state->emb);
+    for (const auto& t : state->hs) buf_push_tensor(buf, t);
+    uint8_t* malloc_buf = (uint8_t*)std::malloc(buf.size());
+    if (malloc_buf == nullptr) return SD_SPLIT_EALLOC;
+    if (!buf.empty()) std::memcpy(malloc_buf, buf.data(), buf.size());
+    *out    = malloc_buf;
+    *nbytes = buf.size();
+    return SD_SPLIT_OK;
+}
+
+int sd_split_state_deserialize(const uint8_t* in, size_t nbytes, sd_split_state_t** out) {
+    if (in == nullptr || nbytes == 0 || out == nullptr) return SD_SPLIT_EINVAL;
+    *out = nullptr;
+    const uint8_t* p   = in;
+    const uint8_t* end = in + nbytes;
+    uint32_t magic = 0;  uint16_t version = 0;
+    uint32_t step_idx = 0, total_steps = 0, hs_count = 0;
+    if (!buf_read<uint32_t>(p, end, magic) || magic != kSplitMagic) return SD_SPLIT_EINVAL;
+    if (!buf_read<uint16_t>(p, end, version) || version != kSplitVersion) return SD_SPLIT_EINVAL;
+    if (!buf_read<uint32_t>(p, end, step_idx))    return SD_SPLIT_EINVAL;
+    if (!buf_read<uint32_t>(p, end, total_steps)) return SD_SPLIT_EINVAL;
+    if (!buf_read<uint32_t>(p, end, hs_count))    return SD_SPLIT_EINVAL;
+    auto st = std::unique_ptr<sd_split_state_t>(new sd_split_state_t());
+    st->step_idx    = static_cast<int>(step_idx);
+    st->total_steps = static_cast<int>(total_steps);
+    if (!buf_read_tensor(p, end, st->h))   return SD_SPLIT_EINVAL;
+    if (!buf_read_tensor(p, end, st->emb)) return SD_SPLIT_EINVAL;
+    st->hs.resize(hs_count);
+    for (uint32_t i = 0; i < hs_count; ++i) {
+        if (!buf_read_tensor(p, end, st->hs[i])) return SD_SPLIT_EINVAL;
+    }
+    *out = st.release();
+    return SD_SPLIT_OK;
+}
+
+int sd_compute_unet_split_step(sd_ctx_t* sd_ctx,
+                               int which_half,
+                               int step_idx,
+                               int total_steps,
+                               sd_split_state_t* state) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || state == nullptr) {
+        return SD_SPLIT_EINVAL;
+    }
+    if (which_half != 0 && which_half != 1) {
+        return SD_SPLIT_EINVAL;
+    }
+    if (step_idx < 0 || total_steps <= 0 || step_idx >= total_steps) {
+        return SD_SPLIT_EINVAL;
+    }
+    auto& sd = *sd_ctx->sd;
+    if (!sd.diffusion_model || !sd.diffusion_model->supports_block_split()) {
+        return SD_SPLIT_ENOTSUP;
+    }
+
+    state->step_idx    = step_idx;
+    state->total_steps = total_steps;
+
+    DiffusionParams params{};
+    params.x         = &state->x;
+    params.timesteps = &state->timesteps;
+    params.context   = state->context.empty()  ? nullptr : &state->context;
+    params.c_concat  = state->c_concat.empty() ? nullptr : &state->c_concat;
+    params.y         = state->y.empty()        ? nullptr : &state->y;
+
+    if (which_half == 0) {
+        if (state->x.empty() || state->timesteps.empty()) return SD_SPLIT_ESTATE;
+        DiffusionHalfCarry carry;
+        const bool ok = sd.diffusion_model->compute_half0(sd.n_threads, params, carry);
+        if (!ok) return SD_SPLIT_ENOTSUP;
+        state->h         = std::move(carry.h);
+        state->hs        = std::move(carry.hs);
+        state->emb       = std::move(carry.emb);
+        state->last_half = 0;
+        return SD_SPLIT_OK;
+    }
+    // which_half == 1
+    if (state->h.empty() || state->emb.empty() || state->hs.empty()) {
+        return SD_SPLIT_ESTATE;
+    }
+    DiffusionHalfCarry carry;
+    carry.h   = state->h;
+    carry.hs  = state->hs;
+    carry.emb = state->emb;
+    sd::Tensor<float> out = sd.diffusion_model->compute_half1(sd.n_threads, params, carry);
+    if (out.empty()) return SD_SPLIT_ENOTSUP;
+    state->noise_pred = std::move(out);
+    state->last_half  = 1;
+    return SD_SPLIT_OK;
+}
+
+// CF12-W7: N-way generalization of sd_compute_unet_split_step. Runs the
+// linearized UNet blocks [block_lo, block_hi) for one denoise step. lo==0
+// seeds from the staged x/timesteps/...; hi>=block_count fills noise_pred;
+// otherwise the carry {h, hs, emb} is left on the state for the next stage.
+// Any contiguous range tiles correctly because the down-path skip residuals
+// ride the hs[] stack forward until the up-path pops them.
+int sd_compute_unet_split_range(sd_ctx_t* sd_ctx,
+                                int block_lo,
+                                int block_hi,
+                                int step_idx,
+                                int total_steps,
+                                sd_split_state_t* state) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || state == nullptr) {
+        return SD_SPLIT_EINVAL;
+    }
+    if (step_idx < 0 || total_steps <= 0 || step_idx >= total_steps) {
+        return SD_SPLIT_EINVAL;
+    }
+    auto& sd = *sd_ctx->sd;
+    if (!sd.diffusion_model || !sd.diffusion_model->supports_block_split()) {
+        return SD_SPLIT_ENOTSUP;
+    }
+    const int total = sd.diffusion_model->split_block_count();
+    if (total <= 0) {
+        return SD_SPLIT_ENOTSUP;
+    }
+    if (block_lo < 0 || block_hi > total || block_lo >= block_hi) {
+        return SD_SPLIT_EINVAL;
+    }
+
+    state->step_idx    = step_idx;
+    state->total_steps = total_steps;
+
+    DiffusionParams params{};
+    params.x         = &state->x;
+    params.timesteps = &state->timesteps;
+    params.context   = state->context.empty()  ? nullptr : &state->context;
+    params.c_concat  = state->c_concat.empty() ? nullptr : &state->c_concat;
+    params.y         = state->y.empty()        ? nullptr : &state->y;
+
+    DiffusionHalfCarry carry_in;
+    if (block_lo > 0) {
+        if (state->h.empty() || state->emb.empty() || state->hs.empty()) {
+            return SD_SPLIT_ESTATE;
+        }
+        carry_in.h   = state->h;
+        carry_in.hs  = state->hs;
+        carry_in.emb = state->emb;
+    } else {
+        if (state->x.empty() || state->timesteps.empty()) {
+            return SD_SPLIT_ESTATE;
+        }
+    }
+
+    DiffusionHalfCarry carry_out;
+    sd::Tensor<float>  out_noise;
+    const bool ok = sd.diffusion_model->compute_range(sd.n_threads, block_lo, block_hi,
+                                                      carry_in, params, carry_out, out_noise);
+    if (!ok) {
+        return SD_SPLIT_ENOTSUP;
+    }
+
+    if (block_hi >= total) {
+        state->noise_pred = std::move(out_noise);
+        state->last_half  = 1;
+    } else {
+        state->h         = std::move(carry_out.h);
+        state->hs        = std::move(carry_out.hs);
+        state->emb       = std::move(carry_out.emb);
+        state->last_half = 0;
+    }
+    return SD_SPLIT_OK;
+}
+
+int sd_unet_block_count(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return 0;
+    }
+    // CF12-W7: real linearized block count from the backbone (e.g. SD1.5 →
+    // 25: conv_in + 11 input + middle + 12 output). 0 for non-UNet backbones
+    // (DiT/MMDiT/Flux/...) and tiny-UNet variants → caller falls back to the
+    // whole-UNet / role-chain path. The planner partitions [0, count) across
+    // however many unet_blocks rigs are available (dynamic N).
+    if (!sd_ctx->sd->diffusion_model) {
+        return 0;
+    }
+    return sd_ctx->sd->diffusion_model->split_block_count();
+}
+
+const char* sd_loaded_backbone_tag(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return "unknown";
+    }
+    SDVersion v = sd_ctx->sd->version;
+    if (sd_version_is_sdxl(v))       return "sdxl";
+    if (sd_version_is_sd2(v))        return "sd2";
+    if (sd_version_is_sd3(v))        return "sd3";
+    if (sd_version_is_flux(v))       return "flux";
+    if (sd_version_is_wan(v))        return "wan";
+    if (sd_version_is_qwen_image(v)) return "qwen_image";
+    if (sd_version_is_z_image(v))    return "z_image";
+    if (sd_version_is_sd1(v))        return "sd1";
+    if (v == VERSION_SVD)            return "svd";
+    return "unknown";
+}
+
 static sd_audio_t* waveform_to_sd_audio(const StableDiffusionGGML* sd,
                                         const sd::Tensor<float>& waveform) {
     if (sd == nullptr || waveform.empty()) {
@@ -5368,4 +5776,170 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         free_sd_audio(generated_audio);
     }
     return true;
+}
+
+// ─── CF12-W6b: TE / VAE bridges ────────────────────────────────────────────
+//
+// Direct C surfaces over `cond_stage_model->get_learned_condition` and
+// `decode_first_stage`.  Used by llama-distributed's role bridge so a TE-
+// only or VAE-only worker can stream real prompt_embeds / pooled tensors
+// or decode latents without invoking the full generate_image orchestrator.
+
+struct sd_cond_t {
+    bool                    has_uncond = false;
+    sd::Tensor<float>       cond_crossattn;
+    sd::Tensor<float>       cond_vector;
+    sd::Tensor<float>       cond_concat;
+    sd::Tensor<float>       uncond_crossattn;
+    sd::Tensor<float>       uncond_vector;
+    sd::Tensor<float>       uncond_concat;
+};
+
+extern "C" sd_cond_t* sd_cond_new(void) {
+    return new sd_cond_t();
+}
+
+extern "C" void sd_cond_free(sd_cond_t* c) {
+    delete c;
+}
+
+extern "C" int sd_cond_has_uncond(const sd_cond_t* c) {
+    return (c && c->has_uncond) ? 1 : 0;
+}
+
+extern "C" int sd_encode_condition(
+    sd_ctx_t*       sd_ctx,
+    const char*     prompt,
+    const char*     negative_prompt,
+    int             clip_skip,
+    int             width,
+    int             height,
+    sd_cond_t*      out)
+{
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) return SD_SPLIT_EINVAL;
+    if (prompt == nullptr || out == nullptr)        return SD_SPLIT_EINVAL;
+    if (!sd_ctx->sd->cond_stage_model)              return SD_SPLIT_ENOTSUP;
+
+    ConditionerParams params;
+    params.text             = prompt;
+    params.clip_skip        = clip_skip;
+    params.width            = (width  > 0) ? width  : 512;
+    params.height           = (height > 0) ? height : 512;
+    params.zero_out_masked  = false;
+    if (sd_ctx->sd->diffusion_model) {
+        params.adm_in_channels = static_cast<int>(sd_ctx->sd->diffusion_model->get_adm_in_channels());
+    }
+
+    try {
+        auto cond = sd_ctx->sd->cond_stage_model->get_learned_condition(
+            sd_ctx->sd->n_threads, params);
+        out->cond_crossattn = std::move(cond.c_crossattn);
+        out->cond_vector    = std::move(cond.c_vector);
+        out->cond_concat    = std::move(cond.c_concat);
+    } catch (...) {
+        return SD_SPLIT_EINVAL;
+    }
+
+    out->has_uncond = false;
+    if (negative_prompt != nullptr && negative_prompt[0] != '\0') {
+        try {
+            params.text            = negative_prompt;
+            params.zero_out_masked = false;
+            auto uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(
+                sd_ctx->sd->n_threads, params);
+            out->uncond_crossattn = std::move(uncond.c_crossattn);
+            out->uncond_vector    = std::move(uncond.c_vector);
+            out->uncond_concat    = std::move(uncond.c_concat);
+            out->has_uncond       = true;
+        } catch (...) {
+            return SD_SPLIT_EINVAL;
+        }
+    }
+
+    return SD_SPLIT_OK;
+}
+
+extern "C" int sd_cond_get_tensor(
+    const sd_cond_t*  c,
+    const char*       name,
+    const float**     out_data,
+    const int64_t**   out_shape,
+    int*              out_ndims)
+{
+    if (c == nullptr || name == nullptr || out_data == nullptr ||
+        out_shape == nullptr || out_ndims == nullptr) return SD_SPLIT_EINVAL;
+
+    const sd::Tensor<float>* t = nullptr;
+    if      (std::strcmp(name, "cond.crossattn")   == 0) t = &c->cond_crossattn;
+    else if (std::strcmp(name, "cond.vector")      == 0) t = &c->cond_vector;
+    else if (std::strcmp(name, "cond.concat")      == 0) t = &c->cond_concat;
+    else if (std::strcmp(name, "uncond.crossattn") == 0) t = c->has_uncond ? &c->uncond_crossattn : nullptr;
+    else if (std::strcmp(name, "uncond.vector")    == 0) t = c->has_uncond ? &c->uncond_vector    : nullptr;
+    else if (std::strcmp(name, "uncond.concat")    == 0) t = c->has_uncond ? &c->uncond_concat    : nullptr;
+    else return SD_SPLIT_EINVAL;
+
+    if (t == nullptr || t->empty()) {
+        *out_data  = nullptr;
+        *out_shape = nullptr;
+        *out_ndims = 0;
+        return SD_SPLIT_EINVAL;
+    }
+    *out_data  = t->data();
+    *out_shape = t->shape().data();
+    *out_ndims = static_cast<int>(t->dim());
+    return SD_SPLIT_OK;
+}
+
+extern "C" int sd_decode_first_stage_to_floats(
+    sd_ctx_t*         sd_ctx,
+    const float*      latent_data,
+    const int64_t*    latent_shape,
+    int               latent_ndims,
+    float**           out_data,
+    int64_t**         out_shape,
+    int*              out_ndims)
+{
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) return SD_SPLIT_EINVAL;
+    if (latent_data == nullptr || latent_shape == nullptr) return SD_SPLIT_EINVAL;
+    if (latent_ndims <= 0 || latent_ndims > 4) return SD_SPLIT_EINVAL;
+    if (out_data == nullptr || out_shape == nullptr || out_ndims == nullptr) return SD_SPLIT_EINVAL;
+    if (!sd_ctx->sd->first_stage_model) return SD_SPLIT_ENOTSUP;
+
+    std::vector<int64_t> shape(latent_shape, latent_shape + latent_ndims);
+    int64_t numel = 1;
+    for (int64_t d : shape) numel *= d;
+    if (numel <= 0) return SD_SPLIT_EINVAL;
+
+    sd::Tensor<float> latent(shape);
+    std::memcpy(latent.data(), latent_data, static_cast<size_t>(numel) * sizeof(float));
+
+    sd::Tensor<float> image;
+    try {
+        image = sd_ctx->sd->decode_first_stage(latent);
+    } catch (...) {
+        return SD_SPLIT_EINVAL;
+    }
+    if (image.empty()) return SD_SPLIT_EINVAL;
+
+    const int64_t img_numel = image.numel();
+    const int64_t img_ndims = image.dim();
+    float*   data_buf  = static_cast<float*>(std::malloc(static_cast<size_t>(img_numel) * sizeof(float)));
+    int64_t* shape_buf = static_cast<int64_t*>(std::malloc(static_cast<size_t>(img_ndims) * sizeof(int64_t)));
+    if (data_buf == nullptr || shape_buf == nullptr) {
+        std::free(data_buf);
+        std::free(shape_buf);
+        return SD_SPLIT_EINVAL;
+    }
+    std::memcpy(data_buf, image.data(), static_cast<size_t>(img_numel) * sizeof(float));
+    for (int64_t i = 0; i < img_ndims; ++i) shape_buf[i] = image.shape()[static_cast<size_t>(i)];
+
+    *out_data  = data_buf;
+    *out_shape = shape_buf;
+    *out_ndims = static_cast<int>(img_ndims);
+    return SD_SPLIT_OK;
+}
+
+extern "C" void sd_vae_image_free(float* data, int64_t* shape) {
+    if (data)  std::free(data);
+    if (shape) std::free(shape);
 }

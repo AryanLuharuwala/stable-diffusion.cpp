@@ -50,6 +50,15 @@ static inline const sd::Tensor<T>& tensor_or_empty(const sd::Tensor<T>* tensor) 
     return tensor != nullptr ? *tensor : kEmpty;
 }
 
+// CF12-W6a: host-side carry-state extracted at the UNet middle-block boundary.
+// Other diffusion backbones (DiT/MMDiT/Flux/Wan/...) do not currently expose a
+// split surface — compute_half0/compute_half1 below return false on them.
+struct DiffusionHalfCarry {
+    sd::Tensor<float>              h;
+    std::vector<sd::Tensor<float>> hs;
+    sd::Tensor<float>              emb;
+};
+
 struct DiffusionModel {
     virtual std::string get_desc()                                               = 0;
     virtual sd::Tensor<float> compute(int n_threads,
@@ -64,6 +73,44 @@ struct DiffusionModel {
     virtual void set_flash_attention_enabled(bool enabled)           = 0;
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes)     = 0;
     virtual void set_circular_axes(bool circular_x, bool circular_y) = 0;
+
+    // CF12-W6a: cross-rig block-split surface. Default returns false (not
+    // supported) so non-UNet backbones don't need to implement it.
+    virtual bool supports_block_split() const { return false; }
+    virtual bool compute_half0(int n_threads,
+                               const DiffusionParams& diffusion_params,
+                               DiffusionHalfCarry& carry_out) {
+        (void)n_threads; (void)diffusion_params; (void)carry_out;
+        return false;
+    }
+    virtual sd::Tensor<float> compute_half1(int n_threads,
+                                            const DiffusionParams& diffusion_params,
+                                            const DiffusionHalfCarry& carry) {
+        (void)n_threads; (void)diffusion_params; (void)carry;
+        return {};
+    }
+
+    // CF12-W7: N-way generalization of the 2-way half split. split_block_count()
+    // returns the number of linear blocks the backbone can be cut into (0 ==
+    // not split-capable → caller falls back to whole-UNet / role-chain).
+    // compute_range runs blocks [lo, hi): lo==0 seeds from diffusion_params
+    // (x/timesteps/...); hi>=split_block_count() fills out_noise with the
+    // final noise_pred; otherwise carry_out holds the {h, hs, emb} handed to
+    // the next stage. carry_in is ignored when lo==0.
+    virtual int split_block_count() const { return 0; }
+    virtual bool compute_range(int n_threads,
+                               int lo,
+                               int hi,
+                               const DiffusionHalfCarry& carry_in,
+                               const DiffusionParams& diffusion_params,
+                               DiffusionHalfCarry& carry_out,
+                               sd::Tensor<float>& out_noise) {
+        (void)n_threads; (void)lo; (void)hi; (void)carry_in;
+        (void)diffusion_params; (void)carry_out; (void)out_noise;
+        return false;
+    }
+
+    virtual ~DiffusionModel() = default;
 };
 
 struct UNetModel : public DiffusionModel {
@@ -134,6 +181,98 @@ struct UNetModel : public DiffusionModel {
                             diffusion_params.num_video_frames,
                             diffusion_params.controls ? *diffusion_params.controls : empty_controls,
                             diffusion_params.control_strength);
+    }
+
+    bool supports_block_split() const override { return true; }
+
+    bool compute_half0(int n_threads,
+                       const DiffusionParams& diffusion_params,
+                       DiffusionHalfCarry& carry_out) override {
+        GGML_ASSERT(diffusion_params.x != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        static const std::vector<sd::Tensor<float>> empty_controls;
+        UNetModelRunner::SplitCarry runner_carry;
+        const bool ok = unet.compute_half0(n_threads,
+                                           *diffusion_params.x,
+                                           *diffusion_params.timesteps,
+                                           tensor_or_empty(diffusion_params.context),
+                                           tensor_or_empty(diffusion_params.c_concat),
+                                           tensor_or_empty(diffusion_params.y),
+                                           diffusion_params.num_video_frames,
+                                           diffusion_params.controls ? *diffusion_params.controls : empty_controls,
+                                           diffusion_params.control_strength,
+                                           runner_carry);
+        if (!ok) {
+            return false;
+        }
+        carry_out.h   = std::move(runner_carry.h);
+        carry_out.hs  = std::move(runner_carry.hs);
+        carry_out.emb = std::move(runner_carry.emb);
+        return true;
+    }
+
+    sd::Tensor<float> compute_half1(int n_threads,
+                                    const DiffusionParams& diffusion_params,
+                                    const DiffusionHalfCarry& carry) override {
+        GGML_ASSERT(diffusion_params.x != nullptr);
+        static const std::vector<sd::Tensor<float>> empty_controls;
+        UNetModelRunner::SplitCarry runner_carry;
+        runner_carry.h   = carry.h;
+        runner_carry.hs  = carry.hs;
+        runner_carry.emb = carry.emb;
+        return unet.compute_half1(n_threads,
+                                  runner_carry,
+                                  tensor_or_empty(diffusion_params.context),
+                                  diffusion_params.num_video_frames,
+                                  diffusion_params.controls ? *diffusion_params.controls : empty_controls,
+                                  diffusion_params.control_strength,
+                                  diffusion_params.x->dim());
+    }
+
+    int split_block_count() const override {
+        return unet.unet.num_split_blocks();
+    }
+
+    bool compute_range(int n_threads,
+                       int lo,
+                       int hi,
+                       const DiffusionHalfCarry& carry_in,
+                       const DiffusionParams& diffusion_params,
+                       DiffusionHalfCarry& carry_out,
+                       sd::Tensor<float>& out_noise) override {
+        static const std::vector<sd::Tensor<float>> empty_controls;
+        UNetModelRunner::SplitCarry cin;
+        cin.h   = carry_in.h;
+        cin.hs  = carry_in.hs;
+        cin.emb = carry_in.emb;
+
+        // The noise_pred restores to the latent (x) dim. lo==0 has x; later
+        // stages reconstruct it from the carried hidden state's rank.
+        size_t dim_hint = 4;
+        if (diffusion_params.x != nullptr) {
+            dim_hint = diffusion_params.x->dim();
+        } else if (!carry_in.h.empty()) {
+            dim_hint = carry_in.h.dim();
+        }
+
+        UNetModelRunner::SplitCarry cout;
+        const bool ok = unet.compute_range(n_threads, lo, hi, cin,
+                                           tensor_or_empty(diffusion_params.x),
+                                           tensor_or_empty(diffusion_params.timesteps),
+                                           tensor_or_empty(diffusion_params.context),
+                                           tensor_or_empty(diffusion_params.c_concat),
+                                           tensor_or_empty(diffusion_params.y),
+                                           diffusion_params.num_video_frames,
+                                           diffusion_params.controls ? *diffusion_params.controls : empty_controls,
+                                           diffusion_params.control_strength,
+                                           dim_hint, cout, out_noise);
+        if (!ok) {
+            return false;
+        }
+        carry_out.h   = std::move(cout.h);
+        carry_out.hs  = std::move(cout.hs);
+        carry_out.emb = std::move(cout.emb);
+        return true;
     }
 };
 
