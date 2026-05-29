@@ -288,6 +288,12 @@ public:
     // conv_in) from x/timesteps/c_concat/y. hi==num_split_blocks() appends
     // the final out-conv (io.h becomes the noise_pred). Otherwise io is the
     // carry handed to the next stage.
+    // out_carry_passthrough (optional): on return, the number of leading
+    // io.hs entries that are unconsumed carry-in residuals (graph-input
+    // leaves passed straight through). The caller persists/reads back only
+    // the NEW suffix io.hs[passthrough..] and splices the prefix host-side —
+    // round-tripping input leaves through the cache does not read back
+    // correctly and corrupts the carry (BUG-2).
     void forward_range(GGMLRunnerContext* ctx,
                        UnetHalfState& io,
                        int lo,
@@ -299,7 +305,8 @@ public:
                        ggml_tensor* y                     = nullptr,
                        int num_video_frames               = -1,
                        std::vector<ggml_tensor*> controls = {},
-                       float control_strength             = 0.f);
+                       float control_strength             = 0.f,
+                       int* out_carry_passthrough         = nullptr);
 
     UnetModelBlock(SDVersion version = VERSION_SD1, const String2TensorStorage& tensor_storage_map = {})
         : version(version) {
@@ -807,7 +814,8 @@ inline void UnetModelBlock::forward_range(
     ggml_tensor* y,
     int num_video_frames,
     std::vector<ggml_tensor*> controls,
-    float control_strength) {
+    float control_strength,
+    int* out_carry_passthrough) {
     const std::vector<BlockStep> sch = build_split_schedule();
     const int total = (int)sch.size();
     if (lo < 0)     lo = 0;
@@ -816,6 +824,12 @@ inline void UnetModelBlock::forward_range(
     ggml_tensor* h               = io.h;
     std::vector<ggml_tensor*> hs = io.hs;
     ggml_tensor* emb             = io.emb;
+
+    // Track the unconsumed carry-in prefix: hs starts as the carry-in stack
+    // (its full length for lo>0; 0 for lo==0 since the prelude clears it).
+    // Pops remove from the back, so newly-pushed residuals go first and the
+    // carry-in leaves at the bottom survive until pops dip below `base`.
+    int base = (lo == 0) ? 0 : (int)hs.size();
 
     int b = lo;
     if (lo == 0) {
@@ -901,6 +915,7 @@ inline void UnetModelBlock::forward_range(
             case BlockStep::OutputRes: {
                 auto h_skip = hs.back();
                 hs.pop_back();
+                if ((int)hs.size() < base) base = (int)hs.size();  // consumed a carry-in leaf
                 if (!controls.empty()) {
                     // control_offset in forward_half1 starts at size-2 and
                     // decrements per output block → size-2-idx for block idx.
@@ -942,6 +957,9 @@ inline void UnetModelBlock::forward_range(
     io.hs  = std::move(hs);
     io.emb = emb;
     io.ds  = boundary_ds();  // informational; forward_range derives ds per block
+    if (out_carry_passthrough != nullptr) {
+        *out_carry_passthrough = base;
+    }
 }
 
 struct UNetModelRunner : public GGMLRunner {
@@ -1194,9 +1212,11 @@ struct UNetModelRunner : public GGMLRunner {
     // as inputs (carry_in ignored); lo>0 takes the carry tensors as inputs.
     // For the final stage (hi>=total) the graph expands on the noise_pred so
     // GGMLRunner::compute returns it directly. For intermediate stages we
-    // persist h/emb/hs[] to the cache and expand on *every* carried tensor —
-    // pass-through residuals from carry_in are graph leaves and would not be
-    // reachable from h alone, so each must be an explicit graph root.
+    // persist h/emb + ONLY the NEWLY-computed residual suffix (io.hs[base..])
+    // and expand on them. The unconsumed carry-in prefix (io.hs[0..base-1])
+    // are graph-input leaves — persisting an input leaf does NOT read back
+    // correctly (BUG-2), so the caller splices that prefix host-side straight
+    // from carry_in. out_passthrough returns `base`.
     ggml_cgraph* build_graph_range(const SplitCarry& carry_in,
                                    int lo,
                                    int hi,
@@ -1207,7 +1227,9 @@ struct UNetModelRunner : public GGMLRunner {
                                    const sd::Tensor<float>& y_tensor,
                                    int num_video_frames,
                                    const std::vector<sd::Tensor<float>>& controls_tensor,
-                                   float control_strength) {
+                                   float control_strength,
+                                   int* out_passthrough = nullptr,
+                                   int* out_new_count   = nullptr) {
         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE);
         const int total = unet.num_split_blocks();
 
@@ -1243,21 +1265,34 @@ struct UNetModelRunner : public GGMLRunner {
                                          : static_cast<int>(io.h->ne[3]);
         }
 
+        int base = 0;
         auto runner_ctx = get_context();
         unet.forward_range(&runner_ctx, io, lo, hi, x, timesteps, context, c_concat, y,
-                           num_video_frames, controls, control_strength);
+                           num_video_frames, controls, control_strength, &base);
+        const int new_count = (int)io.hs.size() - base;
+        if (out_passthrough != nullptr) *out_passthrough = base;
+        if (out_new_count   != nullptr) *out_new_count   = new_count;
 
         if (hi >= total) {
             ggml_build_forward_expand(gf, io.h);  // final: io.h == noise_pred
         } else {
             runner_ctx.persist_cache_tensor(kSplitCacheH, io.h);
-            runner_ctx.persist_cache_tensor(kSplitCacheEmb, io.emb);
-            for (size_t i = 0; i < io.hs.size(); ++i) {
-                runner_ctx.persist_cache_tensor(split_hs_key(i), io.hs[i]);
-            }
             ggml_build_forward_expand(gf, io.h);
-            ggml_build_forward_expand(gf, io.emb);
-            for (size_t i = 0; i < io.hs.size(); ++i) {
+            // emb is computed only at lo==0 (the prelude); for lo>0 it is a
+            // pass-through input leaf (carry_in.emb) that the caller splices
+            // host-side — round-tripping the leaf through the cache is lossy
+            // and corrupts emb for every downstream resblock (BUG-1b).
+            if (lo == 0) {
+                runner_ctx.persist_cache_tensor(kSplitCacheEmb, io.emb);
+                ggml_build_forward_expand(gf, io.emb);
+            }
+            // Persist + expand ONLY the new computed suffix; the prefix
+            // [0,base) are pass-through input leaves (spliced host-side).
+            // The caller reads back exactly new_count keys — the persistent
+            // cache may still hold MORE hs keys from a prior stage's compute,
+            // so "read until missing" would pick up stale residuals (BUG-2).
+            for (size_t i = static_cast<size_t>(base); i < io.hs.size(); ++i) {
+                runner_ctx.persist_cache_tensor(split_hs_key(i - base), io.hs[i]);
                 ggml_build_forward_expand(gf, io.hs[i]);
             }
         }
@@ -1282,9 +1317,12 @@ struct UNetModelRunner : public GGMLRunner {
                        SplitCarry& carry_out,
                        sd::Tensor<float>& out_noise) {
         const int total = unet.num_split_blocks();
+        int passthrough = 0;
+        int new_count   = 0;
         auto get_graph  = [&]() -> ggml_cgraph* {
             return build_graph_range(carry_in, lo, hi, x, timesteps, context,
-                                     c_concat, y, num_video_frames, controls, control_strength);
+                                     c_concat, y, num_video_frames, controls,
+                                     control_strength, &passthrough, &new_count);
         };
         auto result = GGMLRunner::compute<float>(get_graph, n_threads, false);
         if (!result.has_value()) {
@@ -1297,14 +1335,30 @@ struct UNetModelRunner : public GGMLRunner {
         if (!read_cache_sd_tensor(kSplitCacheH, carry_out.h)) {
             return false;
         }
-        if (!read_cache_sd_tensor(kSplitCacheEmb, carry_out.emb)) {
-            return false;
+        // emb: computed at lo==0 (read from cache); pass-through for lo>0
+        // (spliced exactly from carry_in — it is constant across a step's
+        // stages, so this is both correct and lossless).
+        if (lo == 0) {
+            if (!read_cache_sd_tensor(kSplitCacheEmb, carry_out.emb)) {
+                return false;
+            }
+        } else {
+            carry_out.emb = carry_in.emb;
         }
         carry_out.hs.clear();
-        for (size_t i = 0;; ++i) {
+        // Pass-through prefix: spliced straight from carry_in (host tensors)
+        // — never round-tripped through the graph cache.
+        for (int i = 0; i < passthrough && i < (int)carry_in.hs.size(); ++i) {
+            carry_out.hs.push_back(carry_in.hs[i]);
+        }
+        // New suffix: EXACTLY the new_count residuals this stage computed
+        // (keyed 0..new_count-1). Must not "read until missing" — the
+        // persistent cache can hold stale higher-index keys from a prior
+        // stage that pushed more residuals (BUG-2).
+        for (int i = 0; i < new_count; ++i) {
             sd::Tensor<float> hs_i;
             if (!read_cache_sd_tensor(split_hs_key(i), hs_i)) {
-                break;
+                return false;
             }
             carry_out.hs.push_back(std::move(hs_i));
         }
