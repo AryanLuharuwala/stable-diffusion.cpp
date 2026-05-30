@@ -2870,14 +2870,15 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
     free(sd_ctx);
 }
 
-// ─── CF12-W6a: UNet block-split surface (llama-distributed extension) ──────
+// ─── Distributed per-layer UNet execution (see docs/distributed_unet.md) ───
 //
-// Phase-2 — real cross-rig split.  The split-state holds host-side copies
-// of (x, timesteps, context, c_concat, y) staged before half=0, the carry
-// tuple (h, hs[], emb) produced by half=0, and the noise-pred produced by
-// half=1.  Bridge dispatches to diffusion_model->compute_half0/half1,
-// which currently exist on the UNet path only — other backbones return
-// SD_SPLIT_ENOTSUP via DiffusionModel's default implementation.
+// C-API implementation for the block-split surface declared in
+// stable-diffusion.h.  The split-state holds host-side copies of
+// (x, timesteps, context, c_concat, y) staged before the first range, the
+// carry tuple (h, hs[], emb) flowing between ranges, and the noise-pred
+// produced by the final range.  Dispatches to diffusion_model->compute_range
+// (and the legacy compute_half0/half1), which exist on the UNet path only —
+// other backbones return SD_SPLIT_ENOTSUP via DiffusionModel's default.
 
 struct sd_split_state_t {
     sd::Tensor<float>              x;

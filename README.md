@@ -151,6 +151,7 @@ For runtime and parameter backend placement, see the [backend selection guide](.
 - [Docker](./docs/docker.md)
 - [Quantization and GGUF](./docs/quantization_and_gguf.md)
 - [Inference acceleration via caching](./docs/caching.md)
+- [Distributed per-layer UNet execution](./docs/distributed_unet.md)
 
 ## Bindings
 

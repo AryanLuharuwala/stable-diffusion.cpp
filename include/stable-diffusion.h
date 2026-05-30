@@ -480,43 +480,84 @@ SD_API bool preprocess_canny(sd_image_t image,
 SD_API const char* sd_commit(void);
 SD_API const char* sd_version(void);
 
-// ─── CF12-W6a: UNet block-split surface (llama-distributed extension) ──────
+// ─── Distributed per-layer UNet execution ─────────────────────────────────
 //
-// These let an external scheduler split a single UNet forward pass across
-// multiple rigs (or, in the in-process case, two compute_half calls back
-// to back).  The natural cut is the middle-block boundary: at that point
-// the skip-residual stack `hs[]` is full but stationary.
+// This surface lets an external scheduler run a single UNet forward pass as a
+// chain of contiguous block ranges, optionally spread across several rigs, and
+// drive the full denoise loop with a remote-UNet callback.  It is a strict
+// extension: the math, carry-state {h, hs, emb} handling and fp16 boundaries
+// are identical to the monolithic forward() — the split path is the same code
+// walked in pieces, so a single whole-range call is bit-for-bit equivalent.
 //
-// Phase 1 (this patch): the public surface is declared, sd_unet_block_count
-// returns 0 / sd_compute_unet_split_step returns SD_SPLIT_ENOTSUP until the
-// follow-up patch lands the unet.hpp::forward_half body.  This lets the
-// llama-distributed role bridge compile + link against the patched header
-// today; flipping the runtime path on is a single follow-up patch.
+// See docs/distributed_unet.md for the end-to-end driving model.
 //
-// Wire format for the carry-state when crossing process boundaries: SDCD
-// container ("h" + "hs.0..N-1" + step_idx/sigma_idx/is_final kv).  See
-// docs/CF12-W6a-design.md in llama-distributed.
+// Block linearization.  forward() is a linear sequence of blocks:
+//     [0]                     conv_in            (pushes hs[0])
+//     [1 .. n_in-1]           input res / down   (each pushes a skip onto hs[])
+//     [n_in]                  middle             (non-tiny backbones only)
+//     [n_in+1 .. count-1]     output res / up    (each pops a skip off hs[])
+// with the final out-conv folded onto the last stage.  Every per-block detail
+// (downsample factor, layer names, attention placement, controlnet offsets) is
+// a pure function of the block index, so a contiguous range [block_lo, block_hi)
+// is fully reconstructible from the carry-state {h, hs, emb} — no extra fields.
+//
+// Block-range contract.  The range is half-open: [block_lo, block_hi) runs
+// blocks block_lo .. block_hi-1.
+//   * block_lo == 0           seeds the prelude (time/label emb + conv_in) from
+//                             the staged x / timesteps / context / c_concat / y;
+//                             no carry-in is read.
+//   * block_lo  > 0           reads the carry {h, hs, emb} staged on the state.
+//   * block_hi >= block_count appends the final out-conv and produces the
+//                             noise-pred (sd_split_state_get_output).
+//   * otherwise               produces a carry {h, hs, emb} for the next stage
+//                             (sd_split_state_get_carry_tensor).
+// Down-path skip residuals ride the hs[] stack forward across intermediate
+// stages until the up-path pops them, so ANY tiling of [0, block_count) is
+// valid and reassembles the exact whole-UNet result.
+//
+// Tensor layout.  All tensors crossing this surface are sd::Tensor shapes in
+// WHCN order (ggml convention: dim 0 = width, 1 = height, 2 = channels,
+// 3 = batch) — NOT NCHW.  Shapes are passed as int64 arrays whose element [0]
+// is the fastest-varying (width) axis.  Data is plain contiguous fp32.
 
-// Error codes from sd_compute_unet_split_step / serialise helpers.
+// Error codes returned by the split entry points and serialise helpers.
 #define SD_SPLIT_OK         0
-#define SD_SPLIT_EINVAL     1
-#define SD_SPLIT_ENOTSUP    2   // Phase-1 stub: forward_half body not yet implemented
-#define SD_SPLIT_ESTATE     3   // carry-state mismatch (e.g. half=1 without prior half=0)
-#define SD_SPLIT_EALLOC     4
+#define SD_SPLIT_EINVAL     1   // null/invalid argument or out-of-range block index
+#define SD_SPLIT_ENOTSUP    2   // backbone is not split-capable (DiT/Flux/tiny-UNet)
+#define SD_SPLIT_ESTATE     3   // carry-state mismatch (e.g. block_lo>0 without staged carry)
+#define SD_SPLIT_EALLOC     4   // allocation failure
+
+// ── Block introspection ───────────────────────────────────────────────────
+
+// Number of linear UNet blocks the loaded model can be split into. SD1.x/SD2
+// → 25, SDXL → 19 (conv_in + input + middle + output). Returns 0 for non-UNet
+// backbones (DiT/MMDiT/Flux/...) and tiny-UNet variants, where the caller must
+// fall back to the whole-UNet path. A planner partitions [0, count) across
+// however many rigs are available (dynamic N).
+SD_API int sd_unet_block_count(const sd_ctx_t* sd_ctx);
+
+// Backbone tag derived from the loaded model — "sd1" | "sd2" | "sdxl" |
+// "sd3" | "flux" | "pixart" | "unknown". Lets a scheduler advertise the real
+// backbone rather than guessing from a filename.
+SD_API const char* sd_loaded_backbone_tag(const sd_ctx_t* sd_ctx);
+
+// ── Carry-state lifecycle ─────────────────────────────────────────────────
+//
+// The opaque sd_split_state_t holds, for one denoise step: the staged UNet
+// inputs (x, timesteps, context, c_concat, y), the carry {h, hs[], emb} that
+// flows between block ranges, the denoise cursor (step_idx / total_steps), and
+// the final noise-pred. One state object is reused across the ranges of a step.
 
 typedef struct sd_split_state_t sd_split_state_t;   // opaque
 
-// Allocate / free the opaque carry-state.  An sd_split_state_t holds the
-// hidden state `h` + skip stack `hs[]` + sampler/sigma cursor between the
-// two halves of a denoise step, plus the per-step UNet inputs (x,
-// timesteps, context, c_concat, y) staged before calling half=0.
+// Allocate / free the carry-state.
 SD_API sd_split_state_t* sd_split_state_new(void);
 SD_API void              sd_split_state_free(sd_split_state_t* state);
 
-// Stage UNet inputs for an upcoming half=0 call.  All shapes are row-major;
-// pass `data=NULL, shape=NULL, ndims=0` for optional inputs (context,
-// c_concat, y) that the loaded backbone doesn't need.  Data is COPIED into
-// the state and may be freed by the caller after this returns.
+// Stage a UNet input for an upcoming block_lo==0 range. Shapes are WHCN (see
+// "Tensor layout" above); pass `data=NULL, shape=NULL, ndims=0` for optional
+// inputs (context, c_concat, y) the loaded backbone does not need. Data is
+// COPIED into the state and may be freed by the caller after this returns.
 SD_API int sd_split_state_set_input(
     sd_split_state_t* state,
     const char*       name,        // "x" | "timesteps" | "context" | "c_concat" | "y"
@@ -524,19 +565,18 @@ SD_API int sd_split_state_set_input(
     const int64_t*    shape,
     int               ndims);
 
-// Read the half=1 noise-pred output produced by the most recent
-// which_half=1 invocation.  Returns a borrowed pointer to internal storage
-// (valid until the next call that mutates the state).  Pass non-NULL
-// pointers for shape/ndims; the function fills them and returns the data.
+// Read the noise-pred produced by the most recent block_hi>=block_count range.
+// Returns a borrowed pointer (valid until the next call that mutates the state);
+// fills shape/ndims (WHCN). Pass non-NULL shape/ndims.
 SD_API int sd_split_state_get_output(
     const sd_split_state_t* state,
     const float**           data,
     const int64_t**         shape,
     int*                    ndims);
 
-// Read carry-state tensors h / hs.i / emb.  Used by the role bridge to
-// repack the carry into an SDCD UPLD-half wire frame for cross-rig
-// transport.  Same borrow semantics as sd_split_state_get_output.
+// Read carry-state tensors h / emb / hs.i, e.g. to repack the carry for
+// cross-rig transport. sd_split_state_get_carry_count returns the hs[] depth.
+// Same borrow semantics as sd_split_state_get_output.
 SD_API int sd_split_state_get_carry_count(const sd_split_state_t* state, int* hs_count);
 SD_API int sd_split_state_get_carry_tensor(
     const sd_split_state_t* state,
@@ -545,9 +585,9 @@ SD_API int sd_split_state_get_carry_tensor(
     const int64_t**         shape,
     int*                    ndims);
 
-// Set a carry-state tensor (used on the receiving rig after deserialising
-// an SDCD UPLD-half frame).  hs_count must be set first via
-// sd_split_state_set_hs_count.  Data is COPIED.
+// Stage a carry-state tensor on a downstream rig before running a block_lo>0
+// range. hs_count must be set first via sd_split_state_set_hs_count. Data is
+// COPIED.
 SD_API int sd_split_state_set_hs_count(sd_split_state_t* state, int hs_count);
 SD_API int sd_split_state_set_carry_tensor(
     sd_split_state_t* state,
@@ -556,39 +596,21 @@ SD_API int sd_split_state_set_carry_tensor(
     const int64_t*    shape,
     int               ndims);
 
-// Serialise / deserialise the carry-state.  The returned buffer is owned
-// by the library and must be freed with free().  Format is a simple raw
-// blob (magic "SDSP" + version + step idx + hs count + length-prefixed
-// fp32 tensors); the role bridge wraps this in an SDCD container for
-// cross-rig transport, but in-process callers can use this directly.
+// Serialise / deserialise the carry-state into a self-describing raw blob
+// (magic "SDSP" + version + step idx + hs count + length-prefixed fp32
+// tensors). The returned buffer is owned by the library and must be freed with
+// free(). In-process callers can use this directly; cross-rig callers typically
+// wrap it in their own transport frame.
 SD_API int sd_split_state_serialize  (const sd_split_state_t* state, uint8_t** out, size_t* nbytes);
 SD_API int sd_split_state_deserialize(const uint8_t* in, size_t nbytes, sd_split_state_t** out);
 
-// Run `which_half` (0 = input_blocks + middle, 1 = output_blocks + final) of
-// the UNet for `step_idx` of a `total_steps`-long denoise schedule.  Caller
-// must have staged inputs via sd_split_state_set_input before calling
-// which_half=0 (the carry tensors h/hs/emb are produced into the state and
-// available via sd_split_state_get_carry_tensor).  For which_half=1, caller
-// must populate h/hs/emb via sd_split_state_set_* (typically from the
-// previous half=0 call on this rig or an SDCD UPLD-half frame from a peer);
-// the output noise-pred is available via sd_split_state_get_output.
-//
-// Returns 0 (SD_SPLIT_OK) on success, or one of the SD_SPLIT_E* codes.
-SD_API int sd_compute_unet_split_step(
-    sd_ctx_t*           sd_ctx,
-    int                 which_half,
-    int                 step_idx,
-    int                 total_steps,
-    sd_split_state_t*   state);
+// ── Block-range execution ─────────────────────────────────────────────────
 
-// CF12-W7: N-way generalization of sd_compute_unet_split_step. Runs the
-// linearized UNet blocks [block_lo, block_hi) for one denoise step. block_lo==0
-// seeds the prelude from the staged x/timesteps/... inputs; block_hi >=
-// sd_unet_block_count() produces the final noise-pred (sd_split_state_get_output);
-// any other contiguous range produces a carry {h, hs, emb} (sd_split_state_get_carry_*)
-// for the next stage. block_lo>0 requires the carry staged via sd_split_state_set_*.
-// Down-path skip residuals ride the hs[] stack forward across intermediate
-// stages until the up-path consumes them, so any tiling of [0, count) is valid.
+// Run the linearized UNet blocks [block_lo, block_hi) for step_idx of a
+// total_steps-long denoise schedule, following the block-range contract above.
+// `state` carries the inputs in and the carry/noise-pred out. Returns
+// SD_SPLIT_OK on success or one of the SD_SPLIT_E* codes (ENOTSUP when the
+// backbone is not split-capable, ESTATE when a required carry was not staged).
 SD_API int sd_compute_unet_split_range(
     sd_ctx_t*           sd_ctx,
     int                 block_lo,
@@ -597,22 +619,30 @@ SD_API int sd_compute_unet_split_range(
     int                 total_steps,
     sd_split_state_t*   state);
 
-// Number of linear UNet blocks the loaded model can be split into. SD1.x/SD2
-// → 25, SDXL → 19 (conv_in + input + middle + output). 0 for non-UNet
-// backbones and tiny-UNet variants → caller falls back to the whole-UNet /
-// role-chain path. The planner partitions [0, count) across N rigs (dynamic N).
-SD_API int sd_unet_block_count(const sd_ctx_t* sd_ctx);
+// Legacy 2-way convenience over sd_compute_unet_split_range: which_half 0 runs
+// input_blocks + middle (block_lo==0), which_half 1 runs output_blocks + final
+// (block_hi==block_count). Equivalent to the N-way call with the cut at the
+// middle-block boundary; retained for callers that only need the two halves.
+SD_API int sd_compute_unet_split_step(
+    sd_ctx_t*           sd_ctx,
+    int                 which_half,
+    int                 step_idx,
+    int                 total_steps,
+    sd_split_state_t*   state);
 
-// CF12-W7: remote-denoise hook. When a callback is installed, the host runs
-// sd.cpp's full sample() loop (TE, denoiser scalings, sigmas, sampler, VAE all
-// local) but delegates each per-step UNet eval to `cb` — the coordinator drives
-// the N-way block chain across rigs and returns the eps. Pass cb=NULL to clear.
+// ── Remote-denoise hook ────────────────────────────────────────────────────
+
+// Per-step UNet delegate. When installed, the host runs sd.cpp's full sample()
+// loop (text-encode, denoiser scalings, sigmas, sampler, VAE — all local and
+// unchanged) but routes each per-step UNet eval through `cb`, which may drive
+// the N-way block chain across rigs and return the eps.
 //
 // cb is invoked once per conditioning eval (cond and uncond separately under
 // CFG). x is the scaled UNet input (WHCN), timestep the UNet t, ctx the
 // c_crossattn (prompt embeds), y the c_vector (SDXL pooled; ndim 0 if absent).
-// The callee mallocs *out_eps (host frees) and fills out_ne[0..*out_ndim)
-// (out_ne points at a caller buffer of >= 8 slots). Return 0 on success.
+// All shapes are WHCN. The callee mallocs *out_eps (the host frees it) and
+// fills out_ne[0..*out_ndim) (out_ne points at a caller buffer of >= 8 slots).
+// Return 0 on success, non-zero to abort the step.
 typedef int (*sd_remote_unet_cb_t)(
     void*          user,
     const float*   x,   const int64_t* x_ne,   int x_ndim,
@@ -621,12 +651,8 @@ typedef int (*sd_remote_unet_cb_t)(
     const float*   y,   const int64_t* y_ne,   int y_ndim,
     float**        out_eps, int64_t* out_ne,   int* out_ndim);
 
+// Install (or, with cb=NULL, clear) the remote-denoise delegate on sd_ctx.
 SD_API void sd_set_remote_unet_cb(sd_ctx_t* sd_ctx, sd_remote_unet_cb_t cb, void* user);
-
-// Backbone tag derived from the loaded model — "sd1" | "sd2" | "sdxl" |
-// "sd3" | "flux" | "pixart" | "unknown".  Used by the role bridge's
-// cap-advert so the planner sees the real backbone, not a filename guess.
-SD_API const char* sd_loaded_backbone_tag(const sd_ctx_t* sd_ctx);
 
 // ─── CF12-W6b: TE / VAE bridges (llama-distributed extension) ──────────────
 //
