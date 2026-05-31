@@ -5,15 +5,25 @@
 //   A) a monolithic full-range eval   sd_compute_unet_split_range(0, count)
 //   B) a chained 2-stage eval         [0, CUT) -> carry -> [CUT, count)
 // for a single denoise step with deterministic inputs. The split path is
-// documented to be the same code walked in pieces, so A and B must agree
-// within the fp16-boundary error budget (~6%); a 2-way cut at the middle
-// boundary is effectively bit-exact.
+// documented to be the same code walked in pieces, so A and B must agree.
+//
+// Correctness discriminator (project memory cf12-w7-nway-split):
+//   "trivial cuts are BIT-EXACT". A cut at [0,1)/[1,25) (and [0,24)/[24,25))
+//   carries only hs[0]=conv_in (fp32) plus h/emb and must round-trip the carry
+//   plumbing EXACTLY. If the trivial cut is ~0 the get/set/thread carry path is
+//   correct and any residual at an interior cut is genuine fp16-boundary drift,
+//   not a test/carry bug. If the trivial cut is NOT ~0, there is a carry-
+//   threading bug to fix. We use the trivial cut as the real pass criterion and
+//   report a SWEEP {1, 13, 24} so the boundary-error profile is visible.
 //
 // This mirrors the proven reference validator
 //   llama-distributed/python/dpp_runtime/validate_nway_split.py
 // which builds x as a seeded ~N(0,1) latent of WHCN shape (64,64,4,1)
 // (_encode_step_x_frame) at a fixed (step_idx, timestep) and chains the
-// {h, hs, emb} carry between contiguous block ranges (_run_chain).
+// {h, hs, emb} carry between contiguous block ranges (_run_chain). To stay in a
+// representative regime we drive BOTH x and context from seeded randn (the
+// validator's context is real text-encoder output; a fixed-fill context pushes
+// cross-attention into a degenerate regime and inflates boundary error).
 //
 // Build (optional target, off by default):
 //   cmake -DSD_BUILD_SPLIT_TEST=ON ...   ->   target sd-test-unet-split
@@ -49,13 +59,12 @@ constexpr int64_t kCtxTokens = 77;   // n_context
 
 constexpr int kExpectedBlocks = 25;  // SD1.5/SD2 linear block count
 
-// 2-way cut at the legacy middle-block boundary: conv_in(0) + input(1..11) +
-// middle(12) live below, output(13..24) above. Index 13 == "immediately after
-// the middle block" (unet.hpp legacy cut point). Any contiguous cut is valid;
-// this one is the natural / near-bit-exact one.
-constexpr int kCut = 13;
-
-constexpr float kRelTol = 0.12f;  // fp16-boundary budget (validator gates ~6%)
+// Gates. The TRIVIAL cut exercises only the carry plumbing (hs[0]=conv_in,
+// h, emb — all fp32) and must round-trip near-exactly; this is the real pass
+// criterion. The MID cut additionally crosses fp16 block boundaries, so its
+// residual is a (documented) drift budget, not a correctness signal.
+constexpr float kTrivialTol = 1e-3f;   // trivial cut must be ~bit-exact
+constexpr float kMidTol     = 0.12f;   // fp16-boundary budget (validator ~6%)
 
 // Deterministic seeded ~N(0,1) fill, matching the validator's
 // random.Random(seed).gauss(0,1) intent (values, not exact bitstream).
@@ -85,8 +94,10 @@ bool stage_inputs(sd_split_state_t* st) {
         return false;
     }
 
-    // context: fixed deterministic crossattn embedding (zeroed-or-fixed; a
-    // seeded fill keeps it non-degenerate without needing the text encoder).
+    // context: seeded randn crossattn embedding. randn (vs a fixed fill) keeps
+    // cross-attention in a representative, non-degenerate regime closer to the
+    // real text-encoder output the validator uses, so the boundary error we
+    // measure reflects the deployed pipeline rather than a synthetic artifact.
     const int64_t c_shape[4] = {kCtxDim, kCtxTokens, 1, 1};
     const size_t  c_numel    = (size_t)kCtxDim * kCtxTokens;
     std::vector<float> ctx = randn_fill(c_numel, /*seed=*/13);
@@ -124,18 +135,25 @@ bool copy_output(const sd_split_state_t* st, std::vector<float>& out) {
 // real deployment producer/consumer live on different rigs; here we use two
 // distinct state objects so the test exercises the get/set carry path rather
 // than reusing one object's internal carry.
-bool thread_carry(const sd_split_state_t* src, sd_split_state_t* dst) {
+//
+// `verbose` prints the hs_count once and, on the first carry probe, the WHCN
+// shape of hs[0] (conv_in). The public surface delivers carry as "plain
+// contiguous fp32" (stable-diffusion.h "Tensor layout"), so the on-the-wire
+// ggml_type is always fp32 and is not reachable here; the fp16 boundary, if
+// any, is internal to sd_compute_unet_split_range and noted in the writeup.
+bool thread_carry(const sd_split_state_t* src, sd_split_state_t* dst, bool verbose) {
     int hs_count = 0;
     if (sd_split_state_get_carry_count(src, &hs_count) != SD_SPLIT_OK) {
         fprintf(stderr, "get_carry_count failed\n");
         return false;
     }
-    printf("[split] carry hs_count=%d\n", hs_count);
+    if (verbose) printf("[split] carry hs_count=%d\n", hs_count);
     if (sd_split_state_set_hs_count(dst, hs_count) != SD_SPLIT_OK) {
         fprintf(stderr, "set_hs_count failed\n");
         return false;
     }
 
+    bool printed_shape = false;
     auto move_one = [&](const char* name) -> bool {
         const float*   data  = nullptr;
         const int64_t* shape = nullptr;
@@ -143,6 +161,13 @@ bool thread_carry(const sd_split_state_t* src, sd_split_state_t* dst) {
         if (sd_split_state_get_carry_tensor(src, name, &data, &shape, &ndims) != SD_SPLIT_OK) {
             fprintf(stderr, "get_carry_tensor(%s) failed\n", name);
             return false;
+        }
+        if (verbose && !printed_shape && std::strncmp(name, "hs.0", 4) == 0) {
+            printf("[split] carry %s ndims=%d shape=[", name, ndims);
+            for (int i = 0; i < ndims; ++i) printf("%s%lld", i ? "," : "",
+                                                    (long long)shape[i]);
+            printf("] dtype=fp32 (public carry surface; internal boundary may be fp16)\n");
+            printed_shape = true;
         }
         if (sd_split_state_set_carry_tensor(dst, name, data, shape, ndims) != SD_SPLIT_OK) {
             fprintf(stderr, "set_carry_tensor(%s) failed\n", name);
@@ -159,6 +184,72 @@ bool thread_carry(const sd_split_state_t* src, sd_split_state_t* dst) {
         if (!move_one(nm)) return false;
     }
     return true;
+}
+
+struct CutResult {
+    int    cut      = 0;
+    int    hs_count = 0;
+    double max_abs  = 0.0;
+    double rel_rms  = 0.0;
+    bool   ok       = false;   // executed and shapes matched
+};
+
+// Run the chained 2-stage eval [0,cut) -> carry -> [cut,count) and compare its
+// noise-pred to the full-range reference. Returns metrics in `res`.
+CutResult run_2stage(sd_ctx_t* ctx, int cut, int count,
+                     const std::vector<float>& ref, bool verbose) {
+    CutResult res;
+    res.cut = cut;
+
+    sd_split_state_t* st_a = sd_split_state_new();
+    sd_split_state_t* st_b = sd_split_state_new();
+    std::vector<float> out_split;
+
+    do {
+        if (st_a == nullptr || !stage_inputs(st_a)) break;
+        int r = sd_compute_unet_split_range(ctx, 0, cut, /*step_idx=*/0,
+                                            /*total_steps=*/1, st_a);
+        if (r != SD_SPLIT_OK) {
+            fprintf(stderr, "stage0 [0,%d) rc=%d\n", cut, r);
+            break;
+        }
+        if (st_b == nullptr || !stage_inputs(st_b)) break;
+
+        int hs_count = 0;
+        sd_split_state_get_carry_count(st_a, &hs_count);
+        res.hs_count = hs_count;
+
+        if (!thread_carry(st_a, st_b, verbose)) break;
+        r = sd_compute_unet_split_range(ctx, cut, count, /*step_idx=*/0,
+                                        /*total_steps=*/1, st_b);
+        if (r != SD_SPLIT_OK) {
+            fprintf(stderr, "stage1 [%d,%d) rc=%d\n", cut, count, r);
+            break;
+        }
+        if (!copy_output(st_b, out_split)) break;
+
+        if (out_split.size() != ref.size() || ref.empty()) {
+            fprintf(stderr, "numel mismatch ref=%zu split=%zu (cut=%d)\n",
+                    ref.size(), out_split.size(), cut);
+            break;
+        }
+        double sum_sq_diff = 0.0, sum_sq_ref = 0.0, max_abs = 0.0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            const double a = ref[i], b = out_split[i];
+            const double d = std::fabs(a - b);
+            if (d > max_abs) max_abs = d;
+            sum_sq_diff += d * d;
+            sum_sq_ref  += a * a;
+        }
+        res.max_abs = max_abs;
+        res.rel_rms = std::sqrt(sum_sq_diff /
+                                (sum_sq_ref > 1e-12 ? sum_sq_ref : 1e-12));
+        res.ok = true;
+    } while (false);
+
+    if (st_b) sd_split_state_free(st_b);
+    if (st_a) sd_split_state_free(st_a);
+    return res;
 }
 
 }  // namespace
@@ -187,8 +278,6 @@ int main(int argc, char** argv) {
 
     int rc = 1;
     sd_split_state_t* st_full = nullptr;
-    sd_split_state_t* st_a    = nullptr;
-    sd_split_state_t* st_b    = nullptr;
 
     do {
         const char* tag = sd_loaded_backbone_tag(ctx);
@@ -203,7 +292,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-        // ── A: monolithic full-range [0, count) ─────────────────────────────
+        // ── A: monolithic full-range [0, count) reference ───────────────────
         st_full = sd_split_state_new();
         if (st_full == nullptr || !stage_inputs(st_full)) break;
         int r = sd_compute_unet_split_range(ctx, 0, count, /*step_idx=*/0,
@@ -216,70 +305,67 @@ int main(int argc, char** argv) {
         if (!copy_output(st_full, out_full)) break;
         printf("[split] A full-range  numel=%zu\n", out_full.size());
 
-        // ── B: chained 2-stage [0, CUT) -> carry -> [CUT, count) ────────────
-        st_a = sd_split_state_new();
-        if (st_a == nullptr || !stage_inputs(st_a)) break;
-        r = sd_compute_unet_split_range(ctx, 0, kCut, /*step_idx=*/0,
-                                        /*total_steps=*/1, st_a);
-        if (r != SD_SPLIT_OK) {
-            fprintf(stderr, "stage0 [0,%d) rc=%d\n", kCut, r);
-            break;
-        }
+        // ── Trivial-cut PROBE: [0,1) -> [1,count) ───────────────────────────
+        // Carries only hs[0]=conv_in (+ h, emb), all fp32 — no fp16 block
+        // boundary crossed. This isolates the carry get/set/thread plumbing.
+        // If trivial.rel_rms ~ 0, the plumbing is correct and any interior-cut
+        // residual is genuine fp16-boundary drift, NOT a carry bug.
+        printf("[split] --- trivial-cut probe [0,1)/[1,%d) ---\n", count);
+        CutResult trivial = run_2stage(ctx, /*cut=*/1, count, out_full, /*verbose=*/true);
+        if (!trivial.ok) break;
+        printf("[split] TRIVIAL cut=1 hs_count=%d max_abs_diff=%.6e rel_rms=%.6e (%.4f%%)\n",
+               trivial.hs_count, trivial.max_abs, trivial.rel_rms,
+               trivial.rel_rms * 100.0);
 
-        st_b = sd_split_state_new();
-        if (st_b == nullptr) break;
-        // Downstream stage still needs the staged x/timesteps/context/y in
-        // params (they ride the state alongside the carry).
-        if (!stage_inputs(st_b)) break;
-        if (!thread_carry(st_a, st_b)) break;
-        r = sd_compute_unet_split_range(ctx, kCut, count, /*step_idx=*/0,
-                                        /*total_steps=*/1, st_b);
-        if (r != SD_SPLIT_OK) {
-            fprintf(stderr, "stage1 [%d,%d) rc=%d\n", kCut, count, r);
-            break;
+        // ── Boundary-error SWEEP: cuts {1, 13, 24} ──────────────────────────
+        // cut=1  : trivial (conv_in carry only)
+        // cut=13 : legacy middle-block boundary (deepest channels, most hs)
+        // cut=24 : trivial at the top (carry everything but the final out-conv)
+        printf("[split] --- sweep cut,hs_count,max_abs_diff,rel_rms ---\n");
+        const int sweep_cuts[3] = {1, 13, 24};
+        CutResult sweep[3];
+        bool sweep_ok = true;
+        for (int i = 0; i < 3; ++i) {
+            sweep[i] = (sweep_cuts[i] == 1)
+                           ? trivial
+                           : run_2stage(ctx, sweep_cuts[i], count, out_full, /*verbose=*/false);
+            if (!sweep[i].ok) { sweep_ok = false; break; }
+            printf("[split] SWEEP cut=%-2d hs_count=%-2d max_abs_diff=%.6e rel_rms=%.6e (%.4f%%)\n",
+                   sweep[i].cut, sweep[i].hs_count, sweep[i].max_abs,
+                   sweep[i].rel_rms, sweep[i].rel_rms * 100.0);
         }
-        std::vector<float> out_split;
-        if (!copy_output(st_b, out_split)) break;
-        printf("[split] B 2-stage     numel=%zu (cut=%d)\n", out_split.size(), kCut);
+        if (!sweep_ok) break;
 
-        // ── Compare ─────────────────────────────────────────────────────────
-        if (out_full.size() != out_split.size() || out_full.empty()) {
-            fprintf(stderr, "FAIL: numel mismatch A=%zu B=%zu\n",
-                    out_full.size(), out_split.size());
-            printf("RESULT: FAIL\n");
-            break;
+        // mid cut (13) is index 1 of the sweep.
+        const CutResult& mid = sweep[1];
+
+        // ── Gate ────────────────────────────────────────────────────────────
+        // Real pass criterion: the TRIVIAL cut is near-exact (carry plumbing
+        // correct). Secondary: the MID cut stays within the fp16-boundary
+        // budget. A trivial-exact + over-budget mid would point to fp16 drift /
+        // input regime, not a carry bug — reported explicitly either way.
+        const bool trivial_pass = trivial.rel_rms < kTrivialTol;
+        const bool mid_pass     = mid.rel_rms     < kMidTol;
+        const bool pass         = trivial_pass && mid_pass;
+
+        printf("[split] GATE trivial=%s (rel_rms=%.6e < %.0e) "
+               "mid=%s (rel_rms=%.4f < %.2f)\n",
+               trivial_pass ? "PASS" : "FAIL", trivial.rel_rms, (double)kTrivialTol,
+               mid_pass ? "PASS" : "FAIL", mid.rel_rms, (double)kMidTol);
+        if (trivial_pass && !mid_pass) {
+            printf("[split] NOTE: carry plumbing is correct (trivial bit-exact) "
+                   "but mid-cut exceeds the fp16-boundary budget — this is "
+                   "drift/input-regime, not a carry bug.\n");
         }
-        double max_abs = 0.0;
-        double max_rel = 0.0;
-        double sum_sq_diff = 0.0;
-        double sum_sq_ref  = 0.0;
-        for (size_t i = 0; i < out_full.size(); ++i) {
-            const double a = out_full[i];
-            const double b = out_split[i];
-            const double d = std::fabs(a - b);
-            if (d > max_abs) max_abs = d;
-            const double denom = std::fabs(a) > 1e-6 ? std::fabs(a) : 1e-6;
-            const double rel = d / denom;
-            if (rel > max_rel) max_rel = rel;
-            sum_sq_diff += d * d;
-            sum_sq_ref  += a * a;
+        if (!trivial_pass) {
+            printf("[split] NOTE: trivial cut is NOT near-exact — carry "
+                   "threading bug; interior-cut error is meaningless until "
+                   "this is fixed.\n");
         }
-        const double rel_rms =
-            std::sqrt(sum_sq_diff / (sum_sq_ref > 1e-12 ? sum_sq_ref : 1e-12));
-
-        printf("[split] max_abs_diff=%.6e  max_rel_diff=%.4f  rel_rms=%.4f (%.2f%%)\n",
-               max_abs, max_rel, rel_rms, rel_rms * 100.0);
-
-        // Gate on RMS relative error vs signal (matches the validator's `rel`
-        // metric); also report per-element max_rel for diagnostics.
-        const bool pass = rel_rms < kRelTol;
-        printf("RESULT: %s (rel_rms=%.4f, tol=%.2f)\n",
-               pass ? "PASS" : "FAIL", rel_rms, kRelTol);
+        printf("RESULT: %s\n", pass ? "PASS" : "FAIL");
         rc = pass ? 0 : 1;
     } while (false);
 
-    if (st_b)    sd_split_state_free(st_b);
-    if (st_a)    sd_split_state_free(st_a);
     if (st_full) sd_split_state_free(st_full);
     free_sd_ctx(ctx);
     return rc;
