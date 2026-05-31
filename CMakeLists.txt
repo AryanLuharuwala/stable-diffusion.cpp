@@ -314,6 +314,17 @@ if (SD_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
+# Optional standalone test for the distributed per-layer UNet split API.
+# Off by default; enable with -DSD_BUILD_SPLIT_TEST=ON. Needs a real model at
+# runtime (argv[1] or env DIST_SDCPP_MODEL).
+option(SD_BUILD_SPLIT_TEST "sd: build the UNet split-API test" OFF)
+if (SD_BUILD_SPLIT_TEST)
+    add_executable(sd-test-unet-split tests/test_unet_split.cpp)
+    target_link_libraries(sd-test-unet-split PRIVATE ${SD_LIB})
+    target_include_directories(sd-test-unet-split PRIVATE include)
+    target_compile_features(sd-test-unet-split PRIVATE cxx_std_17)
+endif()
+
 set(SD_PUBLIC_HEADERS include/stable-diffusion.h)
 set_target_properties(${SD_LIB} PROPERTIES PUBLIC_HEADER "${SD_PUBLIC_HEADERS}")
 
